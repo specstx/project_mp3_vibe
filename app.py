@@ -12,6 +12,8 @@ Features:
 - "Now Playing" label
 - Rescan button and folder chooser (saves chosen folder in config.json)
 - Caches library to data/library.json
+
+-newest update fixes the code so that songs in music dir doesn't crash the app
 """
 
 import sys
