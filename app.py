@@ -102,7 +102,7 @@ class YinYangRatingWidget(QWidget):
         self.half_icon = QPixmap(str(PROJECT_DIR / "Image" / "half_yin.png"))
         self.full_icon = QPixmap(str(PROJECT_DIR / "Image" / "whole_yin.png"))
         self.empty_icon = QPixmap(str(PROJECT_DIR / "Image" / "empty_yin.png"))
-
+#comment for nothing
         layout = QHBoxLayout()
         layout.setSpacing(2)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -194,7 +194,7 @@ class YinYangRatingWidget(QWidget):
                 self._update_icons()
                 QMessageBox.warning(self, "Error", f"Failed to save rating: {e}")
         return handler
-    
+    #comments too
 # ------------------------
 # Utility functions
 # ------------------------
@@ -226,7 +226,7 @@ def load_library_cache():
         except Exception:
             return None
     return None
-
+#comments
 
 class ClickableSlider(QSlider):
     def mousePressEvent(self, event):
