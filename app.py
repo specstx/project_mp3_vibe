@@ -15,83 +15,27 @@ Features:
 
 -newest update fixes the code so that songs in music dir doesn't crash the app
 """
-
-import sys
 import os
-import json
-import time
-from pathlib import Path
+import sys
 from functools import partial
-
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QSlider, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox,
-    QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,
-)
+    QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,)
+import signal # Add this import near the top of your file (if it's not already there)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import QIcon
-from mutagen.mp3 import MP3
-from mutagen.easyid3 import EasyID3
-
-# ------------------------
-# Config & paths
-# ------------------------
-PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-LIB_CACHE = DATA_DIR / "library.json"
-CONFIG_FILE = PROJECT_DIR / "config.json"
-
+from config import load_config, save_config
+from metadata import ScannerThread, CacheManager, MetadataManager, LIB_CACHE, PROJECT_DIR
+# app.py: Add these lines near the top (after imports)
+from pathlib import Path
 DEFAULT_MUSIC_PATH = str(Path.home() / "Music")
-
 # ------------------------
 # Background scanner thread
 # ------------------------
-class ScannerThread(QThread):
-    finished = pyqtSignal(dict)
-    progress = pyqtSignal(str)
 
-    def __init__(self, root_path):
-        super().__init__()
-        self.root_path = root_path
-
-    def run(self):
-        tree = {}
-        # Walk the directory; produce nested dict structure
-        # We'll follow the structure: folder keys -> subdict; files are added to 'tracks' list
-        for dirpath, dirnames, filenames in os.walk(self.root_path):
-            # relative path from root
-            rel = os.path.relpath(dirpath, self.root_path)
-            if rel == ".":
-                rel = ""
-            # collect mp3s only
-            mp3s = [f for f in filenames if f.lower().endswith('.mp3')]
-            # set in tree
-            parts = rel.split(os.sep) if rel else []
-            node = tree
-            for p in parts:
-                if p == "" or p == ".":
-                    continue
-                node = node.setdefault(p, {})
-            if mp3s:
-                node.setdefault('Unsorted', []).extend(sorted(mp3s))
-            # emit a light progress ping occasionally
-            if hasattr(self, "progress") and int(time.time()) % 2 == 0:
-                self.progress.emit(f"Scanning: {dirpath}")
-        # Prune empty branches (remove nodes without 'tracks' or children)
-        def prune(n):
-            keys = list(n.keys())
-            for k in keys:
-                if k == 'Unsorted':
-                    continue
-                prune(n[k])
-                if not n[k]:  # empty dict
-                    n.pop(k, None)
-            # if only tracks empty leave it; otherwise if no keys return
-        prune(tree)
-        self.finished.emit(tree)
 class YinYangRatingWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -125,18 +69,7 @@ class YinYangRatingWidget(QWidget):
         self._update_icons()
     def load_rating(self, path):
         self._current_path = path
-        try:
-            mp3_file = MP3(path)
-            popms = mp3_file.tags.getall("POPM") if mp3_file.tags else []
-            rating_val = 0
-            if popms:
-                # Use first POPM as default
-                rating_val = popms[0].rating
-            # Convert 0-255 to 0-5 in 0.5 steps
-            rating = round(rating_val / 255 * 5 * 2) / 2
-            self.current_rating = rating
-        except Exception:
-            self.current_rating = 0
+        self.current_rating = MetadataManager.load_rating(path) 
         self._update_icons()
 
     def _update_icons(self, hover_index=None, hover_half=False):
@@ -165,68 +98,34 @@ class YinYangRatingWidget(QWidget):
         return handler
 
     def _make_click_handler(self, index):
+        """Creates a closure function to handle clicks on the rating icons."""
+        
         def handler(event):
             if event.button() != Qt.MouseButton.LeftButton:
                 return
+            
             x = event.position().x()
             lbl = self.icons[index]
             half = x < lbl.width() / 2
+            
             self.current_rating = index + 0.5 if half else index + 1
             self._update_icons()
-            # Save to POPM
-            try:
-                path = getattr(self, "_current_path", None)
-                if path:
-                    audio = MP3(path)
-                    popms = audio.tags.getall("POPM") if audio.tags else []
-                    if popms:
-                        popm = popms[0]
-                    else:
-                        from mutagen.id3 import POPM
-                        popm = POPM(email="user@example.com", rating=0, count=0)
-                        if not audio.tags:
-                            from mutagen.id3 import ID3
-                            audio.add_tags()
-                        audio.tags.add(popm)
-                    popm.rating = int(round(self.current_rating / 5 * 255))
-                    audio.save()
-            except Exception as e:
+
+            path = getattr(self, "_current_path", None)
+            
+            # Call MetadataManager to save the new rating
+            if path and not MetadataManager.save_rating(path, self.current_rating):
+                # If save fails, revert the icons and show a message
+                self.current_rating = MetadataManager.load_rating(path) 
                 self._update_icons()
-                QMessageBox.warning(self, "Error", f"Failed to save rating: {e}")
+                QMessageBox.warning(self, "Error", "Failed to save rating. Check console for details.")
+        
         return handler
     #comments too
 # ------------------------
 # Utility functions
 # ------------------------
-def load_config():
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"music_path": DEFAULT_MUSIC_PATH}
 
-def save_config(cfg):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(cfg, f, indent=2)
-
-def save_library_cache(tree):
-    try:
-        with open(LIB_CACHE, 'w') as f:
-            json.dump(tree, f)
-    except Exception as e:
-        print("Failed saving library cache:", e)
-
-def load_library_cache():
-    if LIB_CACHE.exists():
-        try:
-            with open(LIB_CACHE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-#comments
 
 class ClickableSlider(QSlider):
     def mousePressEvent(self, event):
@@ -385,7 +284,7 @@ class MP3Player(QWidget):
         self.build_layout()
 
         # load cached library or scan
-        cached = load_library_cache()
+        cached = CacheManager.load_library_cache()
         if cached:
             self.library_tree = cached
             self.populate_tree()
@@ -506,7 +405,7 @@ class MP3Player(QWidget):
 
     def on_scan_finished(self, tree):
         self.library_tree = tree
-        save_library_cache(tree)
+        CacheManager.save_library_cache(tree)
         self.populate_tree()
         self.rescan_btn.setEnabled(True)
         self.now_playing_label.setText("Ready")
@@ -568,36 +467,29 @@ class MP3Player(QWidget):
         if not path:
             return
         self.current_mp3_path = path
-        # Tags
-        try:
-            audio = EasyID3(path)
-            for tag, widget in self.tag_fields.items():
-                widget.setText(audio.get(tag, [""])[0])
-        except Exception:
-            for widget in self.tag_fields.values():
-                widget.setText("")
+        
+        tags, art_data = MetadataManager.load_tags_and_art(path)
+
+        # Tags (Update the QLineEdit widgets)
+        for tag, widget in self.tag_fields.items():
+            widget.setText(tags.get(tag, ""))
 
         # Album Art
-        try:
-            mp3_file = MP3(path)
-            if 'APIC:' in mp3_file:
-                apic = mp3_file['APIC:']
-                pixmap = QPixmap()
-                pixmap.loadFromData(apic.data)
-                self.album_art_label.setPixmap(
-                    pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                )
-            else:
-                self.album_art_label.setText("No Album Art")
-                self.album_art_label.setPixmap(QPixmap())
-        except Exception:
+        if art_data:
+            from PyQt6.QtGui import QPixmap 
+            pixmap = QPixmap()
+            pixmap.loadFromData(art_data)
+            self.album_art_label.setPixmap(
+                pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            )
+        else:
             self.album_art_label.setText("No Album Art")
             self.album_art_label.setPixmap(QPixmap())
-
-        # Rating
+        
+        # Rating 
         if hasattr(self, "rating_widget"):
             self.rating_widget._current_path = path
-            self.rating_widget.load_rating(path)    
+            self.rating_widget.load_rating(path)
 
     def on_tree_item_double_clicked(self, item, col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -831,20 +723,27 @@ class MP3Player(QWidget):
         if not self.current_mp3_path:
             QMessageBox.warning(self, "No MP3 Selected", "Please select an MP3 file to save tags.")
             return
-        try:
-            audio = EasyID3(self.current_mp3_path)
-            for tag, editor_widget in self.tag_fields.items():
-                audio[tag] = editor_widget.text()
-            audio.save()
-            QMessageBox.information(self, "Tags Saved", f"Tags for {Path(self.current_mp3_path).name} saved successfully.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error Saving Tags", f"Failed to save tags: {e}")
+        
+        tag_data = {tag: widget.text() for tag, widget in self.tag_fields.items()}
 
+        if MetadataManager.save_tags(self.current_mp3_path, tag_data):
+            from pathlib import Path 
+            QMessageBox.information(self, "Tags Saved", f"Tags for {Path(self.current_mp3_path).name} saved successfully.")
+        else:
+            from pathlib import Path
+            QMessageBox.critical(self, "Error Saving Tags", f"Failed to save tags for {Path(self.current_mp3_path).name}.")
+    
 # ------------------------
 # Main
 # ------------------------
+
+
 def main():
+    # Allow Ctrl+C to stop the application gracefully
+    signal.signal(signal.SIGINT, signal.SIG_DFL) 
+    
     app = QApplication(sys.argv)
+    app.setApplicationName("MP3 Vibe Player")
     win = MP3Player()
     win.show()
     sys.exit(app.exec())
