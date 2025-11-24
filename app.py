@@ -462,12 +462,20 @@ class MP3Player(QWidget):
             self.load_track_info(data.get('path'))
 
         # folders just expand/collapse on double click (default behavior)
+    
+    # app.py: Inside the MP3Player class
+
     def load_track_info(self, path):
         """Load tags, album art, and rating for any track"""
+        # Fix: QPixmap and Qt must be imported here to be available in the 'else' block and for scaling
+        from PyQt6.QtGui import QPixmap 
+        from PyQt6.QtCore import Qt 
+        
         if not path:
             return
         self.current_mp3_path = path
         
+        # Call MetadataManager to get tags and art data
         tags, art_data = MetadataManager.load_tags_and_art(path)
 
         # Tags (Update the QLineEdit widgets)
@@ -476,13 +484,13 @@ class MP3Player(QWidget):
 
         # Album Art
         if art_data:
-            from PyQt6.QtGui import QPixmap 
             pixmap = QPixmap()
             pixmap.loadFromData(art_data)
             self.album_art_label.setPixmap(
                 pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             )
         else:
+            # This handles the case where no album art is found
             self.album_art_label.setText("No Album Art")
             self.album_art_label.setPixmap(QPixmap())
         
@@ -490,7 +498,6 @@ class MP3Player(QWidget):
         if hasattr(self, "rating_widget"):
             self.rating_widget._current_path = path
             self.rating_widget.load_rating(path)
-
     def on_tree_item_double_clicked(self, item, col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data:
@@ -744,6 +751,7 @@ def main():
     
     app = QApplication(sys.argv)
     app.setApplicationName("MP3 Vibe Player")
+    app.setWindowIcon(QIcon('image/mp3.png'))
     win = MP3Player()
     win.show()
     sys.exit(app.exec())
