@@ -73,31 +73,7 @@ class ScannerThread(QThread):
         prune(tree)
         self.finished.emit(tree)
 
-        # metadata.py (Add this class)
 
-class CacheManager:
-    """Handles loading and saving the music library cache from JSON."""
-
-    @staticmethod
-    def load_library_cache():
-        """Loads music data from library.json and returns the tree structure."""
-        if LIB_CACHE.exists():
-            try:
-                with open(LIB_CACHE, 'r') as f:
-                    data = json.load(f)
-                    return data
-            except Exception:
-                pass
-        return {}
-
-    @staticmethod
-    def save_library_cache(tree):
-        """Saves the library tree structure to library.json."""
-        try:
-            with open(LIB_CACHE, 'w') as f:
-                json.dump(tree, f, indent=4)
-        except Exception:
-            pass
 
 # metadata.py (Add this class)
 

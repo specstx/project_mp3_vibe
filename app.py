@@ -17,6 +17,7 @@ Features:
 """
 import os
 import sys
+from models import CacheManager
 from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
@@ -28,7 +29,7 @@ from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import QIcon
 from config import load_config, save_config
-from metadata import ScannerThread, CacheManager, MetadataManager, LIB_CACHE, PROJECT_DIR
+from metadata import ScannerThread, MetadataManager, LIB_CACHE, PROJECT_DIR
 # app.py: Add these lines near the top (after imports)
 from pathlib import Path
 DEFAULT_MUSIC_PATH = str(Path.home() / "Music")
@@ -151,7 +152,6 @@ class MP3Player(QWidget):
         self.music_path = self.cfg.get("music_path", DEFAULT_MUSIC_PATH)
 
         # internal state
-        self.library_tree = {}
         self.playlist_queue = []  # list of dicts: {'path': fullpath, 'title': filename}
         self.current_index = -1
         self.current_mp3_path = None
@@ -288,9 +288,14 @@ class MP3Player(QWidget):
         if cached:
             self.library_tree = cached
             self.populate_tree()
-            # still start a background scan (non-blocking) to find new files
+            self.rescan_btn.setEnabled(True)
+            self.now_playing_label.setText("Ready")
+            
+            # Start a background scan (non-blocking) to find new files
             self.start_scan(background=True)
         else:
+            # If no cache exists, initialize library_tree as empty and start a foreground scan
+            self.library_tree = {}
             self.start_scan(background=False)
 
     def build_layout(self):
@@ -390,14 +395,14 @@ class MP3Player(QWidget):
             return
         self.rescan_btn.setEnabled(False)
         # start thread
-        self.scanner = ScannerThread(self.music_path)
-        self.scanner.finished.connect(self.on_scan_finished)
-        self.scanner.progress.connect(self.on_scan_progress)
+        self.scanner_thread = ScannerThread(self.music_path)
+        self.scanner_thread.finished.connect(self.on_scan_finished)
+        self.scanner_thread.progress.connect(self.on_scan_progress)
         if background:
-            self.scanner.start()
+            self.scanner_thread.start()
         else:
             # blocking run (rare)
-            self.scanner.run()
+            self.scanner_thread.run()
             # run() emits finished which calls on_scan_finished
 
     def on_scan_progress(self, status):
