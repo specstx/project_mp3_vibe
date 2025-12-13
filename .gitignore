@@ -10,3 +10,7 @@ env/
 data/library.json
 config.json
 
+# PyInstaller
+dist/
+build/
+*.spec

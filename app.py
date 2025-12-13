@@ -21,13 +21,12 @@ from models import CacheManager
 from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
-    QPushButton, QLabel, QSlider, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox,
+    QPushButton, QLabel, QSlider, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QCheckBox,
     QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,)
 import signal # Add this import near the top of your file (if it's not already there)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtGui import QIcon
 from config import load_config, save_config
 from metadata import ScannerThread, MetadataManager, LIB_CACHE, PROJECT_DIR
 # app.py: Add these lines near the top (after imports)
@@ -250,7 +249,11 @@ class MP3Player(QWidget):
         self.toggle_view_btn = QPushButton("View")
         self.toggle_view_btn.setFixedSize(70, 20)
         self.toggle_view_btn.clicked.connect(self.toggle_views)
- 
+        # Auto Play on double click checkbox
+        self.autoplay_checkbox = QCheckBox("Auto")
+        self.autoplay_checkbox.setChecked(False)  # default behavior
+        self.autoplay_checkbox.setToolTip("Auto-play newly added songs")
+        
         # assign built-in icons
         style = self.style()
         self.play_btn.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
@@ -355,14 +358,17 @@ class MP3Player(QWidget):
         # --- Row 5: Library controls at bottom ---
         lib_controls_row = QHBoxLayout()
         lib_controls_row.setSpacing(10)
-        self.library_label = QLabel("Library:")
+        self.library_label = QLabel("Lib:")
         lib_controls_row.insertWidget(0, self.library_label)
         lib_controls_row.addWidget(self.rescan_btn)
         lib_controls_row.addWidget(self.folder_btn)
         lib_controls_row.addWidget(self.toggle_view_btn)
-        lib_controls_row.addStretch(1)  # keep buttons left-aligned
-        right_v.addLayout(lib_controls_row)
 
+        # ✔ Add checkbox here
+        lib_controls_row.addWidget(self.autoplay_checkbox)
+
+        lib_controls_row.addStretch(1)
+        right_v.addLayout(lib_controls_row)
         # Right panel frame
         right_frame = QFrame()
         right_frame.setLayout(right_v)
@@ -512,7 +518,14 @@ class MP3Player(QWidget):
             title = data.get('title')
             self.add_to_playlist(path, title)
 
-
+                # If checkbox is checked, immediately play it like a playlist double-click
+        if self.autoplay_checkbox.isChecked():
+            # Reuse the existing playlist double-click handler
+            # Find the last added playlist item
+            last_index = self.playlist_widget.count() - 1
+            if last_index >= 0:
+                item = self.playlist_widget.item(last_index)
+                self.on_playlist_item_double_clicked(item)
 
 
     # ------------------------
@@ -535,18 +548,19 @@ class MP3Player(QWidget):
         self.play_index(idx)
         # load tags, album art, rating for selected track
         self.load_track_info(item.data(Qt.ItemDataRole.UserRole))
-    def on_playlist_item_clicked(self, item):
-        # Grab the file path stored in the item
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if path:
-            # Load tags, album art, and rating for the clicked track
-            self.load_track_info(path)
-
+        
     def on_playlist_item_clicked(self, item):
         """Load tag info when a playlist item is single-clicked."""
+        # Grab the file path stored in the item (for older approach)
+        path = item.data(Qt.ItemDataRole.UserRole)
+
+        # Or via playlist_queue
         index = self.playlist_widget.row(item)
         if 0 <= index < len(self.playlist_queue):
-            self.load_track_info(self.playlist_queue[index]['path'])
+            path = self.playlist_queue[index]['path']
+
+        if path:
+            self.load_track_info(path)
 
     def on_playlist_rows_moved(self, parent, start, end, destination, row):
         # Store currently playing track path
