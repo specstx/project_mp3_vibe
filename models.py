@@ -1,72 +1,62 @@
 # models.py
 
-import json
+import sqlite3
 from pathlib import Path
 
-# --- Configuration for CacheManager ---
+# --- Configuration for Database ---
 PROJECT_DIR = Path(__file__).resolve().parent
-# Define the path to the library cache file
-LIB_CACHE = PROJECT_DIR / "data" / "library_cache.json" 
-
-
-class CacheManager:
-    """Manages serialization and deserialization of the main library structure."""
-
-    @staticmethod
-    def load_library_cache():
-        """Loads music data from library_cache.json and returns the tree structure."""
-        if LIB_CACHE.exists():
-            try:
-                with open(LIB_CACHE, 'r') as f:
-                    data = json.load(f)
-                    return data
-            except (json.JSONDecodeError, FileNotFoundError):
-                # Critical: Return empty structure on corruption or file error
-                print("Warning: Library cache corrupted. Starting fresh scan.")
-                return {}
-        return {}
-
-    @staticmethod
-    def save_library_cache(tree):
-        """Saves the library tree structure to library_cache.json."""
-        # Ensure the 'data' directory exists before writing
-        LIB_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(LIB_CACHE, 'w') as f:
-                json.dump(tree, f, indent=4)
-        except Exception as e:
-            print(f"Error saving library cache: {e}")
-            pass
-
+DB_PATH = PROJECT_DIR / "music_library.db" 
 
 class Song:
     """Represents a single music track with all its metadata."""
 
-    def __init__(self, filepath, title=None, artist=None, rating=0, playtime_ms=0):
-        # Setting the attributes (data) for each track object
-        self.filepath = Path(filepath) # Store path as a Path object for safety
-        self.title = title
+    def __init__(self, file_path, artist=None, title=None, album=None, genre=None, year=None, comment=None, duration=0.0, play_count=0, rating=0.0, **kwargs):
+        self.file_path = Path(file_path) # Store path as a Path object for safety
         self.artist = artist
+        self.title = title
+        self.album = album
+        self.genre = genre
+        self.year = year
+        self.comment = comment
+        self.duration = duration
+        self.play_count = play_count
         self.rating = rating
-        self.playtime_ms = playtime_ms
+        
+        # Handle extended fields (ext_1 to ext_20)
+        for i in range(1, 21):
+            setattr(self, f"ext_{i}", kwargs.get(f"ext_{i}"))
 
     def to_dict(self):
-        """Converts the Song object to a dictionary for JSON serialization."""
-        return {
-            "path": str(self.filepath),
-            "title": self.title,
+        """Converts the Song object to a dictionary for database insertion or serialization."""
+        data = {
+            "file_path": str(self.file_path),
             "artist": self.artist,
-            "rating": self.rating,
-            "duration": self.playtime_ms
+            "title": self.title,
+            "album": self.album,
+            "genre": self.genre,
+            "year": self.year,
+            "comment": self.comment,
+            "duration": self.duration,
+            "play_count": self.play_count,
+            "rating": self.rating
         }
+        for i in range(1, 21):
+            data[f"ext_{i}"] = getattr(self, f"ext_{i}")
+        return data
 
     @staticmethod
     def from_dict(data):
-        """Creates a Song object from a dictionary loaded from JSON."""
+        """Creates a Song object from a dictionary loaded from the database."""
         return Song(
-            filepath=data.get("path"),
-            title=data.get("title"),
+            file_path=data.get("file_path"),
             artist=data.get("artist"),
-            rating=data.get("rating", 0),
-            playtime_ms=data.get("duration", 0)
+            title=data.get("title"),
+            album=data.get("album"),
+            genre=data.get("genre"),
+            year=data.get("year"),
+            comment=data.get("comment"),
+            duration=data.get("duration", 0.0),
+            play_count=data.get("play_count", 0),
+            rating=data.get("rating", 0.0),
+            **{f"ext_{i}": data.get(f"ext_{i}") for i in range(1, 21)}
         )

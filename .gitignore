@@ -14,3 +14,8 @@ config.json
 dist/
 build/
 *.spec
+# Database file
+music_library.db
+
+# Backups
+Backups/

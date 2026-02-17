@@ -17,19 +17,18 @@ Features:
 """
 import os
 import sys
-from models import CacheManager
 from functools import partial
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
+    QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QSlider, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QCheckBox,
     QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,)
-import signal # Add this import near the top of your file (if it's not already there)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
-from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor
+import signal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint
+from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from config import load_config, save_config
-from metadata import ScannerThread, MetadataManager, LIB_CACHE, PROJECT_DIR
-# app.py: Add these lines near the top (after imports)
+from metadata import ScannerThread, MetadataManager, PROJECT_DIR
+from database_logic import DatabaseManager
 from pathlib import Path
 DEFAULT_MUSIC_PATH = str(Path.home() / "Music")
 # ------------------------
@@ -121,6 +120,11 @@ class YinYangRatingWidget(QWidget):
                 QMessageBox.warning(self, "Error", "Failed to save rating. Check console for details.")
         
         return handler
+        
+        
+        
+        
+    
     #comments too
 # ------------------------
 # Utility functions
@@ -130,12 +134,107 @@ class YinYangRatingWidget(QWidget):
 class ClickableSlider(QSlider):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # calculate click ratio
-            value = event.position().x() / self.width()  # 0.0 to 1.0
+            if self.orientation() == Qt.Orientation.Horizontal:
+                value = event.position().x() / self.width()
+            else: # Vertical
+                value = (self.height() - event.position().y()) / self.height()
+            
             new_val = int(value * (self.maximum() - self.minimum()) + self.minimum())
             self.setValue(new_val)
-            self.sliderReleased.emit()  # trigger existing handler
+            self.sliderReleased.emit() # trigger existing handler
         super().mousePressEvent(event)
+
+# ------------------------
+# Custom Volume Control
+# ------------------------
+class VolumeControlWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.audio_output = None
+        
+        self.icon_label = QLabel()
+        self.icon_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.icon_label.setFixedSize(24, 24)
+
+        # --- Popup Slider ---
+        self.slider_popup = QWidget(self, Qt.WindowType.Popup)
+        self.slider_popup.setFixedSize(24, 100)
+        popup_layout = QVBoxLayout()
+        popup_layout.setContentsMargins(0, 5, 0, 5)
+        self.slider_popup.setLayout(popup_layout)
+
+        self.volume_slider = ClickableSlider(Qt.Orientation.Vertical)
+        self.volume_slider.setRange(0, 100)
+        popup_layout.addWidget(self.volume_slider)
+        
+        # --- Main Layout ---
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0,0,0,0)
+        layout.addWidget(self.icon_label)
+        self.setLayout(layout)
+
+        # Connect mouse events using a timer to differentiate single/double clicks
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.toggle_mute)
+        self.icon_label.mousePressEvent = self.icon_mouse_press
+        self.icon_label.mouseDoubleClickEvent = self.icon_mouse_double_click
+
+    def setAudioOutput(self, audio_output):
+        self.audio_output = audio_output
+        self.audio_output.volumeChanged.connect(self.update_from_audio_output)
+        self.audio_output.mutedChanged.connect(self.update_from_audio_output)
+        self.volume_slider.valueChanged.connect(self.set_volume_from_slider)
+        self.update_from_audio_output() # Initial setup
+
+    def set_volume_from_slider(self, value):
+        if self.audio_output:
+            # Temporarily block signals from the slider to prevent feedback loop
+            self.audio_output.blockSignals(True)
+            self.audio_output.setVolume(value / 100.0)
+            self.audio_output.blockSignals(False)
+
+    def update_from_audio_output(self):
+        if not self.audio_output:
+            return
+            
+        # Update slider position
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(int(self.audio_output.volume() * 100))
+        self.volume_slider.blockSignals(False)
+
+        # Update icon
+        style = self.style()
+        if self.audio_output.isMuted() or self.audio_output.volume() == 0:
+            icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaVolumeMuted)
+        elif self.audio_output.volume() < 0.5:
+            icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
+        else:
+            # NOTE: Using SP_MediaVolume for high volume too.
+            # A dedicated high-volume icon is not standard in QStyle.
+            icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
+        
+        self.icon_label.setPixmap(icon.pixmap(22, 22)) # 22x22 for padding
+
+    def icon_mouse_press(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._timer.start(QApplication.doubleClickInterval())
+
+    def icon_mouse_double_click(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._timer.stop()
+            self.show_slider()
+
+    def toggle_mute(self):
+        if self.audio_output:
+            self.audio_output.setMuted(not self.audio_output.isMuted())
+
+    def show_slider(self):
+        # Position the popup right above the icon
+        point = self.mapToGlobal(self.rect().topLeft())
+        self.slider_popup.move(point.x(), point.y() - self.slider_popup.height())
+        self.slider_popup.show()
+
 # ------------------------
 # Main Window
 # ------------------------
@@ -164,9 +263,20 @@ class MP3Player(QWidget):
         self.player.durationChanged.connect(self.on_duration_changed)
         self.player.playbackStateChanged.connect(self.on_playback_state_changed)
 
+        # Custom volume control
+        self.volume_control = VolumeControlWidget()
+        self.volume_control.setAudioOutput(self.audio_output)
+
         # UI pieces
         self.tree = QTreeWidget()
-        self.tree.setHeaderHidden(True)
+        self.tree.setColumnCount(7)
+        self.tree.setHeaderLabels(["Genre", "Artist", "Album", "Title", "Track #", "Rating", "Filename"])
+        self.tree.setRootIsDecorated(False)  # Remove the expander triangles
+        self.tree.setAlternatingRowColors(True)  # Classic list view look
+        self.tree.setIndentation(0)  # Kill all staggered indentation
+        self.tree.setSortingEnabled(True)
+        self.tree.header().setStretchLastSection(True)
+        self.tree.setUniformRowHeights(True)
         self.tree.itemDoubleClicked.connect(self.on_tree_item_double_clicked)
         self.tree.itemClicked.connect(self.on_tree_item_clicked)
         
@@ -286,20 +396,22 @@ class MP3Player(QWidget):
         # Layout arrangement
         self.build_layout()
 
-        # load cached library or scan
-        cached = CacheManager.load_library_cache()
-        if cached:
-            self.library_tree = cached
-            self.populate_tree()
-            self.rescan_btn.setEnabled(True)
-            self.now_playing_label.setText("Ready")
-            
-            # Start a background scan (non-blocking) to find new files
-            self.start_scan(background=True)
-        else:
-            # If no cache exists, initialize library_tree as empty and start a foreground scan
-            self.library_tree = {}
-            self.start_scan(background=False)
+        # Stagger the initial load and scan to allow the UI to show up first
+        QTimer.singleShot(100, self.initial_load_and_scan)
+
+    def initial_load_and_scan(self):
+        """
+        Populates the UI with existing DB data for a fast startup,
+        then starts a background scan to prune and update the library.
+        """
+        # Step 1: Populate the tree immediately with current DB data
+        print("Performing initial library load from database...")
+        self.populate_tree()
+        QApplication.processEvents() # Ensure UI is responsive after initial populate
+        
+        # Step 2: Start the automatic background scan
+        print("Starting automatic background scan to update and prune library...")
+        self.start_scan(background=True)
 
     def build_layout(self):
         # -----------------------------
@@ -339,11 +451,13 @@ class MP3Player(QWidget):
         # Spacer after button group
         control_row.addStretch(1)
 
-        # Right: Total time label
+        # Right: Total time label and Volume Control
         self.total_time_label = QLabel("00:00")
         self.total_time_label.setFixedWidth(60)
         self.total_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         control_row.addWidget(self.total_time_label)
+        control_row.addWidget(self.volume_control)
+
 
         right_v.addLayout(control_row)
 
@@ -392,6 +506,21 @@ class MP3Player(QWidget):
         main_l.addWidget(splitter)
         self.setLayout(main_l)
 
+    def _build_tree_from_songs(self, songs, music_path):
+        tree = {}
+        for song in songs:
+            try:
+                rel_path = os.path.relpath(song.file_path, music_path)
+                parts = list(Path(rel_path).parts)
+                filename = parts.pop()
+                node = tree
+                for part in parts:
+                    node = node.setdefault(part, {})
+                node.setdefault('Unsorted', []).append(filename)
+            except Exception:
+                continue
+        return tree
+
     # ------------------------
     # Scanning
     # ------------------------
@@ -416,51 +545,113 @@ class MP3Player(QWidget):
 
     def on_scan_finished(self, tree):
         self.library_tree = tree
-        CacheManager.save_library_cache(tree)
+        # CacheManager.save_library_cache(tree) # No longer needed, ScannerThread saves to DB
         self.populate_tree()
         self.rescan_btn.setEnabled(True)
         self.now_playing_label.setText("Ready")
+
+    def get_item_path(self, item):
+        path = []
+        temp_item = item
+        while temp_item is not None:
+            text = ""
+            if temp_item.text(0):
+                text = temp_item.text(0)
+            elif temp_item.text(1):
+                text = temp_item.text(1)
+            elif temp_item.text(2):
+                text = temp_item.text(2)
+            
+            if text:
+                path.insert(0, text)
+            
+            temp_item = temp_item.parent()
+        return tuple(path)
+
+    def save_tree_state(self):
+        expanded_paths = set()
+        iterator = QTreeWidgetItemIterator(self.tree)
+        while iterator.value():
+            item = iterator.value()
+            if item.isExpanded():
+                expanded_paths.add(self.get_item_path(item))
+            iterator += 1
+        return expanded_paths
+
+    def restore_tree_state(self, expanded_paths):
+        if not expanded_paths:
+            return
+        iterator = QTreeWidgetItemIterator(self.tree)
+        while iterator.value():
+            item = iterator.value()
+            path = self.get_item_path(item)
+            if path in expanded_paths:
+                item.setExpanded(True)
+            iterator += 1
+
+    def track_sort_key(self, song):
+        """Helper function to safely extract a sortable integer from a track number tag."""
+        try:
+            # Get the track number string from ext_1, default to '0'
+            track_str = str(getattr(song, 'ext_1', '0') or '0')
+            # Handle cases like '7/12' by taking the part before the '/'
+            track_part = track_str.split('/')[0]
+            # Try to convert to an integer
+            return int(track_part)
+        except (ValueError, TypeError):
+            # If conversion fails (e.g., for 'A1'), return 0.
+            # This will group all non-numeric tracks at the beginning.
+            return 0
 
     # ------------------------
     # Tree population
     # ------------------------
     def populate_tree(self):
         self.tree.clear()
-        # recursively add items
-        def add_node(parent, node_dict, path_prefix=""):
-            if isinstance(node_dict, list):
-                # Node itself is a list → create items for each file
-                for t in sorted(node_dict):
-                    display = t
-                    fullpath = os.path.join(self.music_path, t)
-                    leaf = QTreeWidgetItem(parent, [display])
-                    leaf.setData(0, Qt.ItemDataRole.UserRole, {'type': 'track', 'path': fullpath, 'title': t})
-                return
+        self.tree.setHeaderLabels(["Genre", "Artist", "Album", "Title", "Track #", "Rating", "Filename"])
+        all_songs = DatabaseManager.get_all_songs()
+        
+        hierarchy = {}
+        for s in all_songs:
+            g, ar, al = getattr(s, 'genre', None) or "Unknown", getattr(s, 'artist', None) or "Unknown", getattr(s, 'album', None) or "Unknown"
+            hierarchy.setdefault(g, {}).setdefault(ar, {}).setdefault(al, []).append(s)
+
+        for genre, artists in sorted(hierarchy.items()):
+            # Genre Header Row
+            g_item = QTreeWidgetItem(self.tree, [genre])
+            g_item.setFirstColumnSpanned(True)
+            g_item.setBackground(0, QColor("#2d2d2d"))
             
+            for artist, albums in sorted(artists.items()):
+                # Artist Header Row
+                ar_item = QTreeWidgetItem(g_item, [artist])
+                ar_item.setFirstColumnSpanned(True)
+                ar_item.setBackground(1, QColor("#3d3d3d"))
+                
+                for album, songs in sorted(albums.items()):
+                    # Album Header Row
+                    al_item = QTreeWidgetItem(ar_item, [album])
+                    al_item.setFirstColumnSpanned(True)
+                    al_item.setBackground(2, QColor("#4d4d4d"))
+                    
+                    for i, s in enumerate(sorted(songs, key=self.track_sort_key)):
+                        if i % 100 == 0:  # Every 100 songs, process events
+                            QApplication.processEvents()
+                            
+                        filename = os.path.basename(s.file_path)
+                        # THE FULL DATA ROW: Every column populated
+                        t_item = QTreeWidgetItem(al_item, [
+                            getattr(s, 'genre', ''),
+                            getattr(s, 'artist', ''),
+                            getattr(s, 'album', ''),
+                            getattr(s, 'title', '') or filename,
+                            str(getattr(s, 'ext_1', '')),
+                            str(getattr(s, 'rating', '0.0')),
+                            filename
+                        ])
+                        t_item.setData(0, Qt.ItemDataRole.UserRole, {'path': str(s.file_path), 'type': 'track'})
 
-            # first, add folder children (sorted)
-            for name in sorted([k for k in node_dict.keys() if k != 'Unsorted']):
-                item = QTreeWidgetItem(parent, [name])
-                item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'folder', 'path': os.path.join(path_prefix, name)})
-                add_node(item, node_dict[name], os.path.join(path_prefix, name) if path_prefix else name)
-
-            # then, add tracks at this level
-            tracks = node_dict.get('Unsorted', [])
-            for t in sorted(tracks):
-                display = t
-                fullpath = os.path.join(self.music_path, path_prefix, t) if path_prefix else os.path.join(self.music_path, t)
-                leaf = QTreeWidgetItem(parent, [display])
-                leaf.setData(0, Qt.ItemDataRole.UserRole, {'type': 'track', 'path': fullpath, 'title': t})
-        
-        #Comment on 545 to test git 23nov25 112
-        
-        # top-level
-        for top_key in sorted(self.library_tree.keys()):
-            top_item = QTreeWidgetItem(self.tree, [top_key])
-            top_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'folder', 'path': top_key})
-            print(f"Top key: {top_key}, type: {type(self.library_tree[top_key])}")
-            add_node(top_item, self.library_tree[top_key], top_key)
-       # self.tree.expandToDepth(0)
+    
 
     # ------------------------
     # Tree interactions
@@ -516,7 +707,7 @@ class MP3Player(QWidget):
         if data.get('type') == 'track':
             path = data.get('path')
             title = data.get('title')
-            self.add_to_playlist(path, title)
+            self.add_to_playlist(str(path), title)
 
                 # If checkbox is checked, immediately play it like a playlist double-click
         if self.autoplay_checkbox.isChecked():
@@ -727,18 +918,27 @@ class MP3Player(QWidget):
     # Library folder selection
     # ------------------------
     def change_library_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Choose music folder", self.music_path)
-        if folder:
-            self.music_path = folder
-            self.cfg['music_path'] = self.music_path
-            save_config(self.cfg)
-            # clear cache and start fresh scan
-            if LIB_CACHE.exists():
-                try:
-                    LIB_CACHE.unlink()
-                except Exception:
-                    pass
-            self.start_scan(background=True)
+        old_music_path = self.music_path
+        
+        selected_folder = QFileDialog.getExistingDirectory(self, "Choose music folder", self.music_path)
+        
+        # Check if a folder was actually selected (not cancelled)
+        if selected_folder:
+            # If the selected folder is different from the current one
+            if selected_folder != old_music_path:
+                self.music_path = selected_folder
+                self.cfg['music_path'] = self.music_path
+                save_config(self.cfg)
+                # A new folder was chosen, so trigger a full scan.
+                # The scan's finish handler will call populate_tree.
+                self.start_scan(background=True)
+            else:
+                # Same folder was selected, or user confirmed current folder.
+                # Just refresh the view from the current DB. No scan needed.
+                self.populate_tree()
+        else: # User clicked cancel or closed the dialog
+            # The user didn't choose anything, but still wanted a refresh of the current DB state.
+            self.populate_tree()
 
     def toggle_views(self):
         # Swap between library (0) and playlist (1)
@@ -755,6 +955,7 @@ class MP3Player(QWidget):
         if MetadataManager.save_tags(self.current_mp3_path, tag_data):
             from pathlib import Path 
             QMessageBox.information(self, "Tags Saved", f"Tags for {Path(self.current_mp3_path).name} saved successfully.")
+            self.populate_tree()
         else:
             from pathlib import Path
             QMessageBox.critical(self, "Error Saving Tags", f"Failed to save tags for {Path(self.current_mp3_path).name}.")

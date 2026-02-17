@@ -1,75 +1,146 @@
 # metadata.py
 
 import os             # For ScannerThread (os.walk, os.path.join)
-import json           # For CacheManager (json.load, json.dump)
 import time           # For ScannerThread (progress updates)
-from pathlib import Path  # For handling file paths (LIB_CACHE, etc.)
+from pathlib import Path  # For handling file paths
 
 # PyQt6 components needed for the ScannerThread
-from PyQt6.QtCore import QThread, pyqtSignal 
+from PyQt6.QtCore import QThread, pyqtSignal
 
 # Mutagen and ID3 components for tag reading/writing
-from mutagen.mp3 import MP3          # To open and save MP3 files
-from mutagen.easyid3 import EasyID3  # To handle standard ID3 tags easily
-from mutagen.id3 import POPM, ID3    # To handle the custom POPM (rating) tag
+from mutagen.mp3 import MP3
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import POPM, ID3
+from mutagen.oggvorbis import OggVorbis
+from mutagen.flac import FLAC
+from mutagen.mp4 import MP4
 
 # Our custom data model
-# NOTE: This import requires you to have a finished 'models.py' file
-from models import Song, CacheManager
+from models import Song
+from database_logic import DatabaseManager
 
 # ------------------------
-# Config & paths (MOVED from app.py)
+# Config & paths
 # ------------------------
 PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-LIB_CACHE = DATA_DIR / "library.json"
 # We don't need CONFIG_FILE here as that's in config.py
 # We keep DEFAULT_MUSIC_PATH in app.py as it's a default setting, not I/O logic.
 # ------------------------------------------
 class ScannerThread(QThread):
     finished = pyqtSignal(dict)
     progress = pyqtSignal(str)
+    artist_changed = pyqtSignal()
 
     def __init__(self, root_path):
         super().__init__()
         self.root_path = root_path
 
     def run(self):
-        tree = {}
-        # Walk the directory; produce nested dict structure
-        # We'll follow the structure: folder keys -> subdict; files are added to 'tracks' list
+        # --- Step 1: Get initial state ---
+        db_paths = set(DatabaseManager.get_all_filepaths())
+        found_paths = set()
+        
+        tree = {} # This is for the old tree logic, can be removed later
+        song_batch = []
+        self.last_artist = None
+
+        # --- Step 2: Scan file system ---
         for dirpath, dirnames, filenames in os.walk(self.root_path):
-            # relative path from root
+            dirnames[:] = [d for d in dirnames if d.lower() != 'parking' and d != 'Library']
+            
+            current_folder_name = os.path.basename(dirpath)
+            if current_folder_name.lower() == 'parking' or current_folder_name == 'Library':
+                continue
+
             rel = os.path.relpath(dirpath, self.root_path)
             if rel == ".":
                 rel = ""
-            # collect mp3s only
-            mp3s = [f for f in filenames if f.lower().endswith('.mp3')]
-            # set in tree
+            
+            mp3s = [f for f in filenames if f.endswith('.mp3')]
+            
             parts = rel.split(os.sep) if rel else []
             node = tree
             for p in parts:
                 if p == "" or p == ".":
                     continue
                 node = node.setdefault(p, {})
+            
             if mp3s:
                 node.setdefault('Unsorted', []).extend(sorted(mp3s))
-            # emit a light progress ping occasionally
+                for filename in mp3s:
+                    full_path = Path(os.path.join(dirpath, filename))
+                    found_paths.add(str(full_path)) # Add found path to our set
+
+                    artist = title = album = genre = year = comment = tracknumber = None
+                    duration = 0.0
+                    
+                    try:
+                        audio = EasyID3(full_path)
+                        artist = audio.get("artist", [""])[0]
+                        title = audio.get("title", [""])[0]
+                        album = audio.get("album", [""])[0]
+                        genre = audio.get("genre", [""])[0]
+                        year = audio.get("date", [""])[0]
+                        tracknumber = audio.get("tracknumber", [""])[0]
+                        
+                        audio_file = MP3(full_path)
+                        duration = audio_file.info.length if audio_file.info else 0.0
+                        
+                    except Exception as e:
+                        print(f"Warning: Could not read tags for {full_path}: {e}")
+                        title = filename
+                    
+                    # --- Artist tracking for batching ---
+                    current_artist = artist or 'Unknown Artist'
+                    if self.last_artist is None:
+                        self.last_artist = current_artist
+
+                    if current_artist != self.last_artist:
+                        if song_batch:
+                            DatabaseManager.add_songs_batch(song_batch)
+                            song_batch = []
+                        self.artist_changed.emit()
+                        self.last_artist = current_artist
+                        
+                    song = Song(
+                        file_path=str(full_path),
+                        artist=artist,
+                        title=title,
+                        album=album,
+                        genre=genre,
+                        year=year,
+                        duration=duration,
+                        ext_1=tracknumber
+                    )
+                    song_batch.append(song)
+
             if hasattr(self, "progress") and int(time.time()) % 2 == 0:
                 self.progress.emit(f"Scanning: {dirpath}")
-        # Prune empty branches (remove nodes without 'tracks' or children)
-        def prune(n):
-            keys = list(n.keys())
-            for k in keys:
-                if k == 'Unsorted':
-                    continue
-                prune(n[k])
-                if not n[k]:  # empty dict
-                    n.pop(k, None)
-            # if only tracks empty leave it; otherwise if no keys return
-        prune(tree)
-        self.finished.emit(tree)
+        
+        # --- Step 3: Commit final batch and prune database ---
+        if song_batch:
+            DatabaseManager.add_songs_batch(song_batch)
+        
+        stale_paths = db_paths - found_paths
+        if stale_paths:
+            DatabaseManager.delete_songs_by_paths(list(stale_paths))
+
+        # --- Step 4: Finalize and emit finished signal ---
+        try:
+            def prune(n):
+                keys = list(n.keys())
+                for k in keys:
+                    if k == 'Unsorted':
+                        continue
+                    prune(n[k])
+                    if not n[k]:
+                        n.pop(k, None)
+            prune(tree)
+            self.finished.emit(tree)
+        except Exception as e:
+            print("!!! CRITICAL ERROR IN SCANNER THREAD !!!")
+            import traceback
+            traceback.print_exc()
 
 
 
@@ -101,14 +172,24 @@ class MetadataManager:
     # Extracted from MP3Player.save_tags
     @staticmethod
     def save_tags(path, tag_data):
-        """Saves standard ID3 tags to a file."""
+        """Saves standard ID3 tags to a file and updates the database."""
         try:
             audio = EasyID3(path)
             for tag, text in tag_data.items():
                 audio[tag] = text
             audio.save()
+
+            # Remap 'tracknumber' from UI to 'ext_1' for the database model
+            if 'tracknumber' in tag_data:
+                tag_data['ext_1'] = tag_data.pop('tracknumber')
+
+            # Update the database
+            song = Song(file_path=path, **tag_data) # Create a Song object from updated tags
+            DatabaseManager.add_song(song) # This will update existing entry or add new one
+
             return True
-        except Exception:
+        except Exception as e:
+            print(f"Failed to save tags for {path}: {e}")
             return False
 
     # Extracted from YinYangRatingWidget.load_rating
@@ -127,27 +208,35 @@ class MetadataManager:
             return 0
 
     # Extracted from YinYangRatingWidget._make_click_handler
-    @staticmethod
-    def save_rating(path, rating):
-        """Saves the 0-5 rating to the POPM tag of the file at the given path."""
-        try:
-            audio = MP3(path)
-            popms = audio.tags.getall("POPM") if audio.tags else []
-
-            if popms:
-                popm = popms[0]
-            else:
-                from mutagen.id3 import POPM # Need to import POPM again if not at file top
-                popm = POPM(email="user@example.com", rating=0, count=0)
-                if not audio.tags:
-                    from mutagen.id3 import ID3 # Need to import ID3 again if not at file top
-                    audio.add_tags()
-                audio.tags.add(popm)
-
-            # Convert 0-5 rating back to 0-255 integer
-            popm.rating = int(round(rating / 5 * 255))
-            audio.save()
-            return True
-        except Exception as e:
-            print(f"Failed to save rating for {path}: {e}")
-            return False
+        @staticmethod
+        def save_rating(path, rating):
+            """Saves the 0-5 rating to the POPM tag of the file at the given path and updates the database."""
+            try:
+                audio = MP3(path)
+                popms = audio.tags.getall("POPM") if audio.tags else []
+    
+                if popms:
+                    popm = popms[0]
+                else:
+                    popm = POPM(email="user@example.com", rating=0, count=0)
+                    if not audio.tags:
+                        audio.add_tags()
+                    audio.tags.add(popm)
+    
+                # Convert 0-5 rating back to 0-255 integer
+                popm.rating = int(round(rating / 5 * 255))
+                audio.save()
+    
+                # Update the database
+                song = DatabaseManager.get_song_by_path(path)
+                if song:
+                    song.rating = rating
+                    DatabaseManager.add_song(song) # Add_song will update the existing entry
+                else:
+                    print(f"Warning: Song not found in database for path: {path}. Cannot update rating in DB.")
+    
+                return True
+            except Exception as e:
+                print(f"Failed to save rating for {path}: {e}")
+                return False
+    
