@@ -253,6 +253,7 @@ class MP3Player(QWidget):
         self.playlist_queue = []  # list of dicts: {'path': fullpath, 'title': filename}
         self.current_index = -1
         self.current_mp3_path = None
+        self._is_populating = False
 
         # Media player
         self.player = QMediaPlayer()
@@ -607,49 +608,55 @@ class MP3Player(QWidget):
     # Tree population
     # ------------------------
     def populate_tree(self):
-        self.tree.clear()
-        self.tree.setHeaderLabels(["Genre", "Artist", "Album", "Title", "Track #", "Rating", "Filename"])
-        all_songs = DatabaseManager.get_all_songs()
-        
-        hierarchy = {}
-        for s in all_songs:
-            g, ar, al = getattr(s, 'genre', None) or "Unknown", getattr(s, 'artist', None) or "Unknown", getattr(s, 'album', None) or "Unknown"
-            hierarchy.setdefault(g, {}).setdefault(ar, {}).setdefault(al, []).append(s)
-
-        for genre, artists in sorted(hierarchy.items()):
-            # Genre Header Row
-            g_item = QTreeWidgetItem(self.tree, [genre])
-            g_item.setFirstColumnSpanned(True)
-            g_item.setBackground(0, QColor("#2d2d2d"))
+        if self._is_populating:
+            return
+        try:
+            self._is_populating = True
+            self.tree.clear()
+            self.tree.setHeaderLabels(["Genre", "Artist", "Album", "Title", "Track #", "Rating", "Filename"])
+            all_songs = DatabaseManager.get_all_songs()
             
-            for artist, albums in sorted(artists.items()):
-                # Artist Header Row
-                ar_item = QTreeWidgetItem(g_item, [artist])
-                ar_item.setFirstColumnSpanned(True)
-                ar_item.setBackground(1, QColor("#3d3d3d"))
+            hierarchy = {}
+            for s in all_songs:
+                g, ar, al = getattr(s, 'genre', None) or "Unknown", getattr(s, 'artist', None) or "Unknown", getattr(s, 'album', None) or "Unknown"
+                hierarchy.setdefault(g, {}).setdefault(ar, {}).setdefault(al, []).append(s)
+
+            for genre, artists in sorted(hierarchy.items()):
+                # Genre Header Row
+                g_item = QTreeWidgetItem(self.tree, [genre])
+                g_item.setFirstColumnSpanned(True)
+                g_item.setBackground(0, QColor("#2d2d2d"))
                 
-                for album, songs in sorted(albums.items()):
-                    # Album Header Row
-                    al_item = QTreeWidgetItem(ar_item, [album])
-                    al_item.setFirstColumnSpanned(True)
-                    al_item.setBackground(2, QColor("#4d4d4d"))
+                for artist, albums in sorted(artists.items()):
+                    # Artist Header Row
+                    ar_item = QTreeWidgetItem(g_item, [artist])
+                    ar_item.setFirstColumnSpanned(True)
+                    ar_item.setBackground(1, QColor("#3d3d3d"))
                     
-                    for i, s in enumerate(sorted(songs, key=self.track_sort_key)):
-                        if i % 100 == 0:  # Every 100 songs, process events
-                            QApplication.processEvents()
-                            
-                        filename = os.path.basename(s.file_path)
-                        # THE FULL DATA ROW: Every column populated
-                        t_item = QTreeWidgetItem(al_item, [
-                            getattr(s, 'genre', ''),
-                            getattr(s, 'artist', ''),
-                            getattr(s, 'album', ''),
-                            getattr(s, 'title', '') or filename,
-                            str(getattr(s, 'ext_1', '')),
-                            str(getattr(s, 'rating', '0.0')),
-                            filename
-                        ])
-                        t_item.setData(0, Qt.ItemDataRole.UserRole, {'path': str(s.file_path), 'type': 'track'})
+                    for album, songs in sorted(albums.items()):
+                        # Album Header Row
+                        al_item = QTreeWidgetItem(ar_item, [album])
+                        al_item.setFirstColumnSpanned(True)
+                        al_item.setBackground(2, QColor("#4d4d4d"))
+                        
+                        for i, s in enumerate(sorted(songs, key=self.track_sort_key)):
+                            if i % 100 == 0:  # Every 100 songs, process events
+                                QApplication.processEvents()
+                                
+                            filename = os.path.basename(s.file_path)
+                            # THE FULL DATA ROW: Every column populated
+                            t_item = QTreeWidgetItem(al_item, [
+                                getattr(s, 'genre', ''),
+                                getattr(s, 'artist', ''),
+                                getattr(s, 'album', ''),
+                                getattr(s, 'title', '') or filename,
+                                str(getattr(s, 'ext_1', '')),
+                                str(getattr(s, 'rating', '0.0')),
+                                filename
+                            ])
+                            t_item.setData(0, Qt.ItemDataRole.UserRole, {'path': str(s.file_path), 'type': 'track'})
+        finally:
+            self._is_populating = False
 
     
 
