@@ -27,7 +27,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from config import load_config, save_config
-from metadata import ScannerThread, MetadataManager, PROJECT_DIR
+from metadata import ScannerThread, MetadataManager, PROJECT_DIR, create_library_snapshot
 from database_logic import DatabaseManager
 from pathlib import Path
 DEFAULT_MUSIC_PATH = str(Path.home() / "Music")
@@ -36,6 +36,7 @@ DEFAULT_MUSIC_PATH = str(Path.home() / "Music")
 # ------------------------
 
 class YinYangRatingWidget(QWidget):
+    rating_saved = pyqtSignal(str, float) # New signal with path and rating
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
@@ -113,10 +114,13 @@ class YinYangRatingWidget(QWidget):
             path = getattr(self, "_current_path", None)
             
             # Call MetadataManager to save the new rating
-            if path and not MetadataManager.save_rating(path, self.current_rating):
+            if path and MetadataManager.save_rating(path, self.current_rating):
+                self.rating_saved.emit(path, self.current_rating) # Emit signal with path and new rating
+            else:
                 # If save fails, revert the icons and show a message
                 self.current_rating = MetadataManager.load_rating(path) 
                 self._update_icons()
+                QMessageBox.warning(self, "Error", "Failed to save rating. Check console for details.")
                 QMessageBox.warning(self, "Error", "Failed to save rating. Check console for details.")
         
         return handler
@@ -129,6 +133,45 @@ class YinYangRatingWidget(QWidget):
 # ------------------------
 # Utility functions
 # ------------------------
+class CustomTreeWidgetItem(QTreeWidgetItem):
+    """
+    A custom QTreeWidgetItem that overrides the sorting logic for specific columns.
+    """
+    def __lt__(self, other):
+        sort_column = self.treeWidget().sortColumn()
+        
+        # In-place column index for "Track #" is 2
+        if sort_column == 2:
+            try:
+                # Pre-process the string to handle "X/Y" format, then convert to int
+                my_text = self.text(sort_column).split('/')[0]
+                other_text = other.text(sort_column).split('/')[0]
+                my_num = int(my_text)
+                other_num = int(other_text)
+                return my_num < other_num
+            except (ValueError, TypeError):
+                # If conversion fails for any reason, fallback to default string comparison
+                return super().__lt__(other)
+        
+        # For all other columns, use the default comparison
+        return super().__lt__(other)
+
+class TagFixerThread(QThread):
+    finished = pyqtSignal(int, int) # successful_fixes, failed_fixes
+
+    def __init__(self, tags_to_fix):
+        super().__init__()
+        self.tags_to_fix = tags_to_fix
+
+    def run(self):
+        successful = 0
+        failed = 0
+        for path, new_value in self.tags_to_fix:
+            if MetadataManager.save_tags(path, {'tracknumber': new_value}):
+                successful += 1
+            else:
+                failed += 1
+        self.finished.emit(successful, failed)
 
 
 class ClickableSlider(QSlider):
@@ -255,6 +298,19 @@ class MP3Player(QWidget):
         self.current_mp3_path = None
         self._is_populating = False
 
+        # Color constants
+        self._COLOR_OFF_WHITE = QColor("#E0E0E0")
+        self._COLOR_AMBER_GOLD = QColor("#FFC107")
+        self._COLOR_GREEN = QColor("#00E676")
+        self._COLOR_BLUE = QColor("#3C83F6")
+        self._COLOR_VIOLET = QColor("#A78BFA")
+        self._COLOR_DIM_BLUE = QColor("#4A6D9C")
+        self._COLOR_DIM_VIOLET = QColor("#7A6FAC")
+        self._COLOR_BG_DARK_CHARCOAL = QColor("#1C1C1C")
+        self._COLOR_BG_PURE_BLACK = QColor("#000000")
+
+        self._snapshot_is_dirty = False # New flag for library snapshot optimization
+
         # Media player
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -271,15 +327,24 @@ class MP3Player(QWidget):
         # UI pieces
         self.tree = QTreeWidget()
         self.tree.setColumnCount(7)
-        self.tree.setHeaderLabels(["Genre", "Artist", "Album", "Title", "Track #", "Rating", "Filename"])
+        self.tree.setHeaderLabels(["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"])
         self.tree.setRootIsDecorated(False)  # Remove the expander triangles
         self.tree.setAlternatingRowColors(True)  # Classic list view look
+        # Set custom alternating row colors via stylesheet
+        self.tree.setStyleSheet(f"""
+            QTreeWidget {{
+                alternate-background-color: {self._COLOR_BG_DARK_CHARCOAL.name()};
+                background-color: {self._COLOR_BG_PURE_BLACK.name()};
+            }}
+        """)
         self.tree.setIndentation(0)  # Kill all staggered indentation
         self.tree.setSortingEnabled(True)
         self.tree.header().setStretchLastSection(True)
         self.tree.setUniformRowHeights(True)
         self.tree.itemDoubleClicked.connect(self.on_tree_item_double_clicked)
         self.tree.itemClicked.connect(self.on_tree_item_clicked)
+        self.tree.itemExpanded.connect(self._update_hierarchy_item_color)
+        self.tree.itemCollapsed.connect(self._update_hierarchy_item_color)
         
         self.playlist_widget = QListWidget()
         self.playlist_widget.setDragDropMode(QListWidget.DragDropMode.InternalMove)
@@ -323,6 +388,7 @@ class MP3Player(QWidget):
         # Replace rating label with interactive rating widget
         self.rating_widget = YinYangRatingWidget()
         self.tag_editor_layout.addRow("Rating", self.rating_widget)
+        self.rating_widget.rating_saved.connect(self.on_rating_changed) # Connect rating changes to in-place update slot
 
         self.save_tags_btn = QPushButton("Save Tags")
         self.save_tags_btn.clicked.connect(self.save_tags)
@@ -400,19 +466,52 @@ class MP3Player(QWidget):
         # Stagger the initial load and scan to allow the UI to show up first
         QTimer.singleShot(100, self.initial_load_and_scan)
 
+    def _mark_snapshot_dirty(self):
+        self._snapshot_is_dirty = True
+        print("Snapshot marked as dirty.") # For debugging
+
+    def update_library_snapshot(self, force_update=False):
+        """
+        Updates the stored library snapshot in config.json if forced or if the snapshot is dirty.
+        """
+        if force_update or self._snapshot_is_dirty:
+            print("Updating library snapshot...")
+            current_snapshot = create_library_snapshot(self.music_path)
+            self.cfg['library_snapshot'] = current_snapshot
+            save_config(self.cfg)
+            self._snapshot_is_dirty = False
+            print("Library snapshot updated.")
+        else:
+            print("Snapshot not dirty, skipping update.")
+
     def initial_load_and_scan(self):
         """
         Populates the UI with existing DB data for a fast startup,
         then starts a background scan to prune and update the library.
         """
-        # Step 1: Populate the tree immediately with current DB data
-        print("Performing initial library load from database...")
-        self.populate_tree()
-        QApplication.processEvents() # Ensure UI is responsive after initial populate
-        
-        # Step 2: Start the automatic background scan
-        print("Starting automatic background scan to update and prune library...")
-        self.start_scan(background=True)
+        # Step 0: Check if scan is needed
+        saved_snapshot = self.cfg.get('library_snapshot')
+        current_snapshot = create_library_snapshot(self.music_path)
+
+        if saved_snapshot and saved_snapshot == current_snapshot:
+            print("Library unchanged, skipping background scan.")
+            # Step 1: Populate the tree immediately with current DB data
+            print("Performing initial library load from database...")
+            self.populate_tree()
+            QApplication.processEvents() # Ensure UI is responsive
+            self.rescan_btn.setEnabled(True)
+            self.now_playing_label.setText("Ready")
+            return
+        else:
+            print("Library changed or no previous snapshot, initiating background scan.")
+            # Step 1: Populate the tree immediately with current DB data
+            print("Performing initial library load from database...")
+            self.populate_tree()
+            QApplication.processEvents() # Ensure UI is responsive after initial populate
+            
+            # Step 2: Start the automatic background scan
+            print("Starting automatic background scan to update and prune library...")
+            self.start_scan(background=True)
 
     def build_layout(self):
         # -----------------------------
@@ -544,12 +643,45 @@ class MP3Player(QWidget):
     def on_scan_progress(self, status):
         self.now_playing_label.setText(status)
 
-    def on_scan_finished(self, tree):
+    def on_scan_finished(self, tree, tags_to_fix):
         self.library_tree = tree
         # CacheManager.save_library_cache(tree) # No longer needed, ScannerThread saves to DB
         self.populate_tree()
         self.rescan_btn.setEnabled(True)
         self.now_playing_label.setText("Ready")
+        self.update_library_snapshot(force_update=True)
+
+        if tags_to_fix:
+            reply = QMessageBox.question(
+                self,
+                "Clean Tags",
+                f"Found {len(tags_to_fix)} tracks with 'funky' track numbers. Clean them up now?",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Ok
+            )
+            if reply == QMessageBox.StandardButton.Ok:
+                self._apply_tag_fixes(tags_to_fix)
+
+    def _apply_tag_fixes(self, tags_to_fix):
+        """Starts a background thread to apply track number fixes."""
+        self.now_playing_label.setText(f"Fixing {len(tags_to_fix)} tags...")
+        self.fixer_thread = TagFixerThread(tags_to_fix)
+        self.fixer_thread.finished.connect(self._on_tag_fix_finished)
+        self.fixer_thread.start()
+
+    def _on_tag_fix_finished(self, successful, failed):
+        """Handles the completion of the TagFixerThread."""
+        self.now_playing_label.setText("Tag fixing complete.")
+        QMessageBox.information(
+            self, 
+            "Tag Fix Complete",
+            f"Successfully fixed {successful} tags.\nFailed to fix {failed} tags."
+        )
+        # The database is now in sync with the file tags, but the view is not.
+        # A full populate is needed to show the corrected numbers.
+        self.populate_tree()
+        # The files have been modified, so we need a new snapshot.
+        self.update_library_snapshot(force_update=True)
 
     def get_item_path(self, item):
         path = []
@@ -590,6 +722,15 @@ class MP3Player(QWidget):
                 item.setExpanded(True)
             iterator += 1
 
+    def _format_duration(self, seconds):
+        """Converts seconds into MM:SS string."""
+        if seconds is None:
+            return "00:00"
+        secs = int(seconds)
+        mins = secs // 60
+        secs %= 60
+        return f"{mins:02d}:{secs:02d}"
+
     def track_sort_key(self, song):
         """Helper function to safely extract a sortable integer from a track number tag."""
         try:
@@ -613,7 +754,7 @@ class MP3Player(QWidget):
         try:
             self._is_populating = True
             self.tree.clear()
-            self.tree.setHeaderLabels(["Genre", "Artist", "Album", "Title", "Track #", "Rating", "Filename"])
+            self.tree.setHeaderLabels(["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"])
             all_songs = DatabaseManager.get_all_songs()
             
             hierarchy = {}
@@ -623,21 +764,24 @@ class MP3Player(QWidget):
 
             for genre, artists in sorted(hierarchy.items()):
                 # Genre Header Row
-                g_item = QTreeWidgetItem(self.tree, [genre])
+                g_item = CustomTreeWidgetItem(self.tree, [genre])
                 g_item.setFirstColumnSpanned(True)
-                g_item.setBackground(0, QColor("#2d2d2d"))
+                g_item.setForeground(0, self._COLOR_AMBER_GOLD) # Set initial text color for closed genre
+                g_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'genre'})
                 
                 for artist, albums in sorted(artists.items()):
                     # Artist Header Row
-                    ar_item = QTreeWidgetItem(g_item, [artist])
+                    ar_item = CustomTreeWidgetItem(g_item, [artist])
                     ar_item.setFirstColumnSpanned(True)
-                    ar_item.setBackground(1, QColor("#3d3d3d"))
+                    ar_item.setForeground(0, self._COLOR_DIM_BLUE) # Set initial text color for closed artist
+                    ar_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'artist'})
                     
                     for album, songs in sorted(albums.items()):
                         # Album Header Row
-                        al_item = QTreeWidgetItem(ar_item, [album])
+                        al_item = CustomTreeWidgetItem(ar_item, [album])
                         al_item.setFirstColumnSpanned(True)
-                        al_item.setBackground(2, QColor("#4d4d4d"))
+                        al_item.setForeground(0, self._COLOR_DIM_VIOLET) # Set initial text color for closed album
+                        al_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'album'})
                         
                         for i, s in enumerate(sorted(songs, key=self.track_sort_key)):
                             if i % 100 == 0:  # Every 100 songs, process events
@@ -645,18 +789,46 @@ class MP3Player(QWidget):
                                 
                             filename = os.path.basename(s.file_path)
                             # THE FULL DATA ROW: Every column populated
-                            t_item = QTreeWidgetItem(al_item, [
-                                getattr(s, 'genre', ''),
-                                getattr(s, 'artist', ''),
-                                getattr(s, 'album', ''),
+                            t_item = CustomTreeWidgetItem(al_item, [
                                 getattr(s, 'title', '') or filename,
+                                getattr(s, 'artist', ''),
                                 str(getattr(s, 'ext_1', '')),
+                                self._format_duration(getattr(s, 'duration', 0.0)),
                                 str(getattr(s, 'rating', '0.0')),
-                                filename
+                                str(getattr(s, 'year', '')),
+                                getattr(s, 'comment', '')
                             ])
                             t_item.setData(0, Qt.ItemDataRole.UserRole, {'path': str(s.file_path), 'type': 'track'})
+                            t_item.setForeground(0, self._COLOR_OFF_WHITE) # Set text color for tracks
         finally:
             self._is_populating = False
+
+    def _update_hierarchy_item_color(self, item):
+        """
+        Dynamically updates the text color of a hierarchy item based on its type and expanded state.
+        """
+        item_data = item.data(0, Qt.ItemDataRole.UserRole)
+        item_type = item_data.get('type') if item_data else None
+
+        if item_type == 'track':
+            # Tracks always remain off-white, no dynamic change here
+            return
+
+        if item.isExpanded():
+            if item_type == 'genre':
+                item.setForeground(0, self._COLOR_GREEN)
+            elif item_type == 'artist':
+                item.setForeground(0, self._COLOR_BLUE)
+            elif item_type == 'album':
+                item.setForeground(0, self._COLOR_VIOLET)
+        else:
+            # Collapsed items revert to their respective "dim" colors
+            if item_type == 'genre':
+                item.setForeground(0, self._COLOR_AMBER_GOLD)
+            elif item_type == 'artist':
+                item.setForeground(0, self._COLOR_DIM_BLUE)
+            elif item_type == 'album':
+                item.setForeground(0, self._COLOR_DIM_VIOLET)
 
     
 
@@ -670,6 +842,24 @@ class MP3Player(QWidget):
         if data.get('type') == 'track':
             self.load_track_info(data.get('path'))
 
+    def _find_track_item_by_path(self, file_path):
+        """Iterates through the tree to find the track item matching a file path."""
+        iterator = QTreeWidgetItemIterator(self.tree)
+        while iterator.value():
+            item = iterator.value()
+            item_data = item.data(0, Qt.ItemDataRole.UserRole)
+            if item_data and item_data.get('type') == 'track' and item_data.get('path') == file_path:
+                return item
+            iterator += 1
+        return None
+
+    def on_rating_changed(self, path, new_rating):
+        """Slot to handle in-place update of a track's rating."""
+        item = self._find_track_item_by_path(path)
+        if item:
+            # Column 4 is "Rating" based on ["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"]
+            item.setText(4, str(new_rating))
+            self._mark_snapshot_dirty()
         # folders just expand/collapse on double click (default behavior)
     
     # app.py: Inside the MP3Player class
@@ -713,17 +903,21 @@ class MP3Player(QWidget):
             return
         if data.get('type') == 'track':
             path = data.get('path')
-            title = data.get('title')
+            
+            # Retrieve the full song object to get the correct title
+            song = DatabaseManager.get_song_by_path(path)
+            title = getattr(song, 'title', None) or os.path.basename(path) # Use filename as fallback
+
             self.add_to_playlist(str(path), title)
 
-                # If checkbox is checked, immediately play it like a playlist double-click
-        if self.autoplay_checkbox.isChecked():
-            # Reuse the existing playlist double-click handler
-            # Find the last added playlist item
-            last_index = self.playlist_widget.count() - 1
-            if last_index >= 0:
-                item = self.playlist_widget.item(last_index)
-                self.on_playlist_item_double_clicked(item)
+            # If checkbox is checked, immediately play it like a playlist double-click
+            if self.autoplay_checkbox.isChecked():
+                # Reuse the existing playlist double-click handler
+                # Find the last added playlist item
+                last_index = self.playlist_widget.count() - 1
+                if last_index >= 0:
+                    item = self.playlist_widget.item(last_index)
+                    self.on_playlist_item_double_clicked(item)
 
 
     # ------------------------
@@ -952,20 +1146,62 @@ class MP3Player(QWidget):
         current_index = self.left_stacked.currentIndex()
         self.left_stacked.setCurrentIndex(1 - current_index) 
 
+    def closeEvent(self, event):
+        """
+        Overrides the close event to stop playback and ensure the library snapshot is updated if dirty.
+        """
+        self.player.stop() # Stop any currently playing audio
+        self.update_library_snapshot() # This will check if dirty and save if needed
+        event.accept()
+
     def save_tags(self):
         if not self.current_mp3_path:
             QMessageBox.warning(self, "No MP3 Selected", "Please select an MP3 file to save tags.")
             return
-        
-        tag_data = {tag: widget.text() for tag, widget in self.tag_fields.items()}
 
-        if MetadataManager.save_tags(self.current_mp3_path, tag_data):
-            from pathlib import Path 
-            QMessageBox.information(self, "Tags Saved", f"Tags for {Path(self.current_mp3_path).name} saved successfully.")
-            self.populate_tree()
-        else:
-            from pathlib import Path
+        # --- Step 1: Get old and new tag data ---
+        # Get old song data from DB to check for hierarchy changes
+        old_song = DatabaseManager.get_song_by_path(self.current_mp3_path)
+        if not old_song:
+            QMessageBox.critical(self, "Error", "Could not find the song in the database to compare.")
+            return
+            
+        # Get new data from the form fields
+        new_tag_data = {tag: widget.text() for tag, widget in self.tag_fields.items()}
+
+        # --- Step 2: Save the tags to the file and database ---
+        if not MetadataManager.save_tags(self.current_mp3_path, new_tag_data.copy()): # Use copy as save_tags modifies it
             QMessageBox.critical(self, "Error Saving Tags", f"Failed to save tags for {Path(self.current_mp3_path).name}.")
+            return
+        
+        QMessageBox.information(self, "Tags Saved", f"Tags for {Path(self.current_mp3_path).name} saved successfully.")
+        self._mark_snapshot_dirty()
+
+        # --- Step 3: Decide how to update the UI ---
+        hierarchy_changed = (
+            old_song.genre != new_tag_data.get('genre') or
+            old_song.artist != new_tag_data.get('artist') or
+            old_song.album != new_tag_data.get('album')
+        )
+
+        if hierarchy_changed:
+            # --- Complex Update: Hierarchy has changed ---
+            print("Hierarchy changed, performing full refresh with state restoration.")
+            expanded_paths = self.save_tree_state()
+            self.populate_tree()
+            self.restore_tree_state(expanded_paths)
+        else:
+            # --- Simple Update: In-place text change ---
+            print("Performing in-place update.")
+            item = self._find_track_item_by_path(self.current_mp3_path)
+            if item:
+                # Column mapping: ["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"]
+                item.setText(0, new_tag_data.get('title', ''))
+                item.setText(1, new_tag_data.get('artist', ''))
+                item.setText(2, new_tag_data.get('tracknumber', ''))
+                # 'Length' doesn't change with tags, so we don't update it
+                # 'Rating' is handled separately
+                # 'Year' and 'Comment' are not in the default tag_fields, but if they were, they'd be updated here.
     
 # ------------------------
 # Main
