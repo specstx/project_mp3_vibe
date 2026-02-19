@@ -27,13 +27,17 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # We keep DEFAULT_MUSIC_PATH in app.py as it's a default setting, not I/O logic.
 # ------------------------------------------
 class ScannerThread(QThread):
-    finished = pyqtSignal(dict, list) # dict: library tree, list: tags to fix
+    finished = pyqtSignal(dict, list, list, dict) # dict: library tree, list: tags to fix, list: years to fix, dict: snapshot
     progress = pyqtSignal(str)
     artist_changed = pyqtSignal()
 
     def __init__(self, root_path):
         super().__init__()
         self.root_path = root_path
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
 
     def run(self):
         # --- Step 1: Get initial state ---
@@ -43,10 +47,18 @@ class ScannerThread(QThread):
         tree = {} # This is for the old tree logic, can be removed later
         song_batch = []
         tags_to_fix = [] # New list for collecting sanitization tasks
+        years_to_fix = [] # New list for collecting year sanitization tasks
         self.last_artist = None
+        
+        # Snapshot data collected during the walk
+        latest_mod_time = 0.0
+        file_count = 0
 
         # --- Step 2: Scan file system ---
         for dirpath, dirnames, filenames in os.walk(self.root_path):
+            if not self.is_running:
+                break
+
             dirnames[:] = [d for d in dirnames if d.lower() != 'parking' and d != 'Library']
             
             current_folder_name = os.path.basename(dirpath)
@@ -69,6 +81,9 @@ class ScannerThread(QThread):
             if mp3s:
                 node.setdefault('Unsorted', []).extend(sorted(mp3s))
                 for filename in mp3s:
+                    if not self.is_running:
+                        break
+
                     full_path = Path(os.path.join(dirpath, filename))
                     found_paths.add(str(full_path)) # Add found path to our set
 
@@ -89,47 +104,59 @@ class ScannerThread(QThread):
                         if was_changed:
                             tags_to_fix.append((str(full_path), clean_tracknumber))
                         
+                        # Sanitize the year
+                        was_year_changed, clean_year = sanitize_year(year)
+                        if was_year_changed:
+                            years_to_fix.append((str(full_path), clean_year))
+                        
                         audio_file = MP3(full_path)
                         duration = audio_file.info.length if audio_file.info else 0.0
+                        
+                        # Snapshot updates
+                        file_count += 1
+                        file_mtime = os.path.getmtime(full_path)
+                        latest_mod_time = max(latest_mod_time, file_mtime)
                         
                     except Exception as e:
                         print(f"Warning: Could not read tags for {full_path}: {e}")
                         title = filename
                         clean_tracknumber = "" # Ensure clean_tracknumber exists
+                        clean_year = ""      # Ensure clean_year exists
                     
-                    # --- Artist tracking for batching ---
-                    current_artist = artist or 'Unknown Artist'
-                    if self.last_artist is None:
-                        self.last_artist = current_artist
-
-                    if current_artist != self.last_artist:
-                        if song_batch:
-                            DatabaseManager.add_songs_batch(song_batch)
-                            song_batch = []
-                        self.artist_changed.emit()
-                        self.last_artist = current_artist
-                        
                     song = Song(
                         file_path=str(full_path),
                         artist=artist,
                         title=title,
                         album=album,
                         genre=genre,
-                        year=year,
+                        year=clean_year,
                         duration=duration,
                         ext_1=clean_tracknumber # Use the clean value for the DB
                     )
                     song_batch.append(song)
 
+                    # Batch database writes every 500 songs
+                    if len(song_batch) >= 500:
+                        DatabaseManager.add_songs_batch(song_batch)
+                        song_batch = []
+                        if artist and artist != self.last_artist:
+                            self.artist_changed.emit()
+                            self.last_artist = artist
+
             if hasattr(self, "progress") and int(time.time()) % 2 == 0:
                 self.progress.emit(f"Scanning: {dirpath}")
         
+        if not self.is_running:
+            print("Scan aborted by user.")
+            return
+
         # --- Step 3: Commit final batch and prune database ---
         if song_batch:
             DatabaseManager.add_songs_batch(song_batch)
         
         stale_paths = db_paths - found_paths
         if stale_paths:
+            print(f"Pruning {len(stale_paths)} stale paths...")
             DatabaseManager.delete_songs_by_paths(list(stale_paths))
 
         # --- Step 4: Finalize and emit finished signal ---
@@ -143,7 +170,9 @@ class ScannerThread(QThread):
                     if not n[k]:
                         n.pop(k, None)
             prune(tree)
-            self.finished.emit(tree, tags_to_fix) # Emit both tree and the list of tags to fix
+            
+            snapshot = {'latest_mod_time': latest_mod_time, 'file_count': file_count}
+            self.finished.emit(tree, tags_to_fix, years_to_fix, snapshot) # Emit all four items
         except Exception as e:
             print("!!! CRITICAL ERROR IN SCANNER THREAD !!!")
             import traceback
@@ -260,21 +289,13 @@ def create_library_snapshot(music_path):
         return {'latest_mod_time': 0.0, 'file_count': 0}
 
     for root, dirs, files in os.walk(music_path):
-        try:
-            # Check modification time of the directory itself
-            dir_mtime = os.path.getmtime(root)
-            latest_mod_time = max(latest_mod_time, dir_mtime)
-        except OSError:
-            # Ignore directories we don't have permission to read
-            pass
-
         for file in files:
             file_path = os.path.join(root, file)
             try:
                 if file.lower().endswith('.mp3'): # Only count MP3s
                     file_count += 1
-                file_mtime = os.path.getmtime(file_path)
-                latest_mod_time = max(latest_mod_time, file_mtime)
+                    file_mtime = os.path.getmtime(file_path)
+                    latest_mod_time = max(latest_mod_time, file_mtime)
             except OSError:
                 # Ignore files we don't have permission to read
                 pass
@@ -310,3 +331,23 @@ def sanitize_track_number(original_str):
              return (True, "") # It was sanitized to blank
         else:
              return (False, "") # It was already blank
+def sanitize_year(original_str):
+    """
+    Sanitizes a year string by taking the part before any '
+' or '
+' delimiters.
+    Returns a tuple: (was_changed, new_value)
+    """
+    if not original_str or not isinstance(original_str, str):
+        return (False, "")
+
+    original_str = original_str.strip()
+    
+    # Replace backslashes with forward slashes for consistency
+    normalized_str = original_str.replace('\\\\', '//')
+    
+    if '//' in normalized_str:
+        clean_str = normalized_str.split('//')[0].strip()
+        return (True, clean_str)
+    
+    return (False, original_str)

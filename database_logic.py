@@ -82,6 +82,18 @@ class DatabaseManager:
         return [Song.from_dict(dict(row)) for row in rows]
 
     @staticmethod
+    def get_all_songs_sorted():
+        """Retrieves all songs sorted by genre, artist, and album for efficient hierarchy building."""
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        # Use the newly created indices for a fast sorted query
+        cursor.execute("SELECT * FROM library ORDER BY genre, artist, album, file_path")
+        rows = cursor.fetchall()
+        conn.close()
+        return [Song.from_dict(dict(row)) for row in rows]
+
+    @staticmethod
     def get_all_filepaths():
         """Retrieves a list of all file paths currently in the database."""
         conn = sqlite3.connect(DB_PATH)
@@ -91,19 +103,25 @@ class DatabaseManager:
         conn.close()
         return [row[0] for row in rows]
 
-    @staticmethod
-    def delete_songs_by_paths(paths: list[str]):
-        """Deletes songs from the database for a given list of file paths."""
-        if not paths:
-            return
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        try:
-            # Using placeholders for a safe query
-            placeholders = ','.join('?' for _ in paths)
-            query = f"DELETE FROM library WHERE file_path IN ({placeholders})"
-            cursor.execute(query, tuple(paths))
-            conn.commit()
-            print(f"Successfully pruned {cursor.rowcount} stale records.")
-        finally:
-            conn.close()
+        @staticmethod
+        def delete_songs_by_paths(paths: list[str]):
+            """Deletes songs from the database for a given list of file paths in chunks."""
+            if not paths:
+                return
+            
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            chunk_size = 900 # Staying well under the 999 limit
+            
+            try:
+                for i in range(0, len(paths), chunk_size):
+                    chunk = paths[i:i + chunk_size]
+                    placeholders = ','.join('?' for _ in chunk)
+                    query = f"DELETE FROM library WHERE file_path IN ({placeholders})"
+                    cursor.execute(query, tuple(chunk))
+                
+                conn.commit()
+                print(f"Successfully pruned stale records.")
+            finally:
+                conn.close()
+    

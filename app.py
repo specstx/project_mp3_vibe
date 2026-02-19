@@ -174,6 +174,24 @@ class TagFixerThread(QThread):
         self.finished.emit(successful, failed)
 
 
+class YearFixerThread(QThread):
+    finished = pyqtSignal(int, int) # successful_fixes, failed_fixes
+
+    def __init__(self, years_to_fix):
+        super().__init__()
+        self.years_to_fix = years_to_fix
+
+    def run(self):
+        successful = 0
+        failed = 0
+        for path, new_value in self.years_to_fix:
+            if MetadataManager.save_tags(path, {'date': new_value}):
+                successful += 1
+            else:
+                failed += 1
+        self.finished.emit(successful, failed)
+
+
 class ClickableSlider(QSlider):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -186,6 +204,19 @@ class ClickableSlider(QSlider):
             self.setValue(new_val)
             self.sliderReleased.emit() # trigger existing handler
         super().mousePressEvent(event)
+
+class TreePopulationThread(QThread):
+    finished = pyqtSignal(dict)
+
+    def run(self):
+        # Retrieve all songs sorted by genre, artist, and album to speed up hierarchy building
+        all_songs = DatabaseManager.get_all_songs_sorted()
+        hierarchy = {}
+        for s in all_songs:
+            g, ar, al = getattr(s, 'genre', None) or "Unknown", getattr(s, 'artist', None) or "Unknown", getattr(s, 'album', None) or "Unknown"
+            hierarchy.setdefault(g, {}).setdefault(ar, {}).setdefault(al, []).append(s)
+        self.finished.emit(hierarchy)
+
 
 # ------------------------
 # Custom Volume Control
@@ -232,10 +263,7 @@ class VolumeControlWidget(QWidget):
 
     def set_volume_from_slider(self, value):
         if self.audio_output:
-            # Temporarily block signals from the slider to prevent feedback loop
-            self.audio_output.blockSignals(True)
             self.audio_output.setVolume(value / 100.0)
-            self.audio_output.blockSignals(False)
 
     def update_from_audio_output(self):
         if not self.audio_output:
@@ -310,6 +338,10 @@ class MP3Player(QWidget):
         self._COLOR_BG_PURE_BLACK = QColor("#000000")
 
         self._snapshot_is_dirty = False # New flag for library snapshot optimization
+        self.scanner_thread = None
+        self.fixer_thread = None
+        self.year_fixer_thread = None
+        self._tree_state_to_restore = None
 
         # Media player
         self.player = QMediaPlayer()
@@ -376,8 +408,18 @@ class MP3Player(QWidget):
             "genre": QLineEdit(),
         }
 
-        for label, widget in self.tag_fields.items():
-            self.tag_editor_layout.addRow(label.capitalize(), widget)
+        display_labels = {
+            "artist": "Artist",
+            "title": "Title",
+            "albumartist": "Album Artist",
+            "tracknumber": "Track #",
+            "album": "Album",
+            "genre": "Genre",
+        }
+
+        for tag_name, display_name in display_labels.items():
+            widget = self.tag_fields[tag_name]
+            self.tag_editor_layout.addRow(display_name, widget)
 
         # Album Art and Rating (display only for now)
         self.album_art_label = QLabel("No Album Art")
@@ -470,13 +512,18 @@ class MP3Player(QWidget):
         self._snapshot_is_dirty = True
         print("Snapshot marked as dirty.") # For debugging
 
-    def update_library_snapshot(self, force_update=False):
+    def update_library_snapshot(self, force_update=False, snapshot=None):
         """
         Updates the stored library snapshot in config.json if forced or if the snapshot is dirty.
+        If a snapshot dict is provided, it uses that instead of re-scanning.
         """
         if force_update or self._snapshot_is_dirty:
             print("Updating library snapshot...")
-            current_snapshot = create_library_snapshot(self.music_path)
+            if snapshot:
+                current_snapshot = snapshot
+            else:
+                current_snapshot = create_library_snapshot(self.music_path)
+            
             self.cfg['library_snapshot'] = current_snapshot
             save_config(self.cfg)
             self._snapshot_is_dirty = False
@@ -497,7 +544,9 @@ class MP3Player(QWidget):
             print("Library unchanged, skipping background scan.")
             # Step 1: Populate the tree immediately with current DB data
             print("Performing initial library load from database...")
-            self.populate_tree()
+            # Restore state if available (fallback to old expanded_paths if tree_state is missing)
+            tree_state = self.cfg.get('tree_state', self.cfg.get('expanded_paths', []))
+            self.populate_tree(tree_state)
             QApplication.processEvents() # Ensure UI is responsive
             self.rescan_btn.setEnabled(True)
             self.now_playing_label.setText("Ready")
@@ -506,7 +555,9 @@ class MP3Player(QWidget):
             print("Library changed or no previous snapshot, initiating background scan.")
             # Step 1: Populate the tree immediately with current DB data
             print("Performing initial library load from database...")
-            self.populate_tree()
+            # Restore state if available
+            tree_state = self.cfg.get('tree_state', self.cfg.get('expanded_paths', []))
+            self.populate_tree(tree_state)
             QApplication.processEvents() # Ensure UI is responsive after initial populate
             
             # Step 2: Start the automatic background scan
@@ -643,13 +694,13 @@ class MP3Player(QWidget):
     def on_scan_progress(self, status):
         self.now_playing_label.setText(status)
 
-    def on_scan_finished(self, tree, tags_to_fix):
+    def on_scan_finished(self, tree, tags_to_fix, years_to_fix, snapshot):
         self.library_tree = tree
         # CacheManager.save_library_cache(tree) # No longer needed, ScannerThread saves to DB
         self.populate_tree()
         self.rescan_btn.setEnabled(True)
         self.now_playing_label.setText("Ready")
-        self.update_library_snapshot(force_update=True)
+        self.update_library_snapshot(force_update=True, snapshot=snapshot)
 
         if tags_to_fix:
             reply = QMessageBox.question(
@@ -661,6 +712,18 @@ class MP3Player(QWidget):
             )
             if reply == QMessageBox.StandardButton.Ok:
                 self._apply_tag_fixes(tags_to_fix)
+        
+        if years_to_fix:
+            reply = QMessageBox.question(
+                self,
+                "Clean Year Tags",
+                f"Found {len(years_to_fix)} tracks with invalid year formats. Clean them up now?",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Ok
+            )
+            if reply == QMessageBox.StandardButton.Ok:
+                self._apply_year_fixes(years_to_fix)
+
 
     def _apply_tag_fixes(self, tags_to_fix):
         """Starts a background thread to apply track number fixes."""
@@ -683,6 +746,28 @@ class MP3Player(QWidget):
         # The files have been modified, so we need a new snapshot.
         self.update_library_snapshot(force_update=True)
 
+    def _apply_year_fixes(self, years_to_fix):
+        """Starts a background thread to apply year fixes."""
+        self.now_playing_label.setText(f"Fixing {len(years_to_fix)} year tags...")
+        self.year_fixer_thread = YearFixerThread(years_to_fix)
+        self.year_fixer_thread.finished.connect(self._on_year_fix_finished)
+        self.year_fixer_thread.start()
+
+    def _on_year_fix_finished(self, successful, failed):
+        """Handles the completion of the YearFixerThread."""
+        self.now_playing_label.setText("Year tag fixing complete.")
+        QMessageBox.information(
+            self,
+            "Year Fix Complete",
+            f"Successfully fixed {successful} year tags.\nFailed to fix {failed} year tags."
+        )
+        # The database is now in sync with the file tags, but the view is not.
+        # A full populate is needed to show the corrected numbers.
+        self.populate_tree()
+        # The files have been modified, so we need a new snapshot.
+        self.update_library_snapshot(force_update=True)
+
+
     def get_item_path(self, item):
         path = []
         temp_item = item
@@ -702,25 +787,52 @@ class MP3Player(QWidget):
         return tuple(path)
 
     def save_tree_state(self):
-        expanded_paths = set()
+        state = {
+            'expanded_paths': [],
+            'top_item_path': None
+        }
+        # 1. Capture expanded paths
         iterator = QTreeWidgetItemIterator(self.tree)
         while iterator.value():
             item = iterator.value()
             if item.isExpanded():
-                expanded_paths.add(self.get_item_path(item))
+                state['expanded_paths'].append(self.get_item_path(item))
             iterator += 1
-        return expanded_paths
+            
+        # 2. Capture top visible item
+        top_item = self.tree.itemAt(0, 0)
+        if top_item:
+            state['top_item_path'] = self.get_item_path(top_item)
+            
+        return state
 
-    def restore_tree_state(self, expanded_paths):
-        if not expanded_paths:
+    def restore_tree_state(self, state):
+        if not state:
             return
-        iterator = QTreeWidgetItemIterator(self.tree)
-        while iterator.value():
-            item = iterator.value()
-            path = self.get_item_path(item)
-            if path in expanded_paths:
-                item.setExpanded(True)
-            iterator += 1
+            
+        # Handle if state is just a list (backward compatibility for old expansion-only logic)
+        if isinstance(state, list):
+            state = {'expanded_paths': state, 'top_item_path': None}
+            
+        expanded_paths = state.get('expanded_paths', [])
+        top_item_path = state.get('top_item_path')
+        
+        # 1. Restore expansion states
+        if expanded_paths:
+            # Convert paths to tuples for comparison
+            exp_set = set(tuple(p) for p in expanded_paths)
+            iterator = QTreeWidgetItemIterator(self.tree)
+            while iterator.value():
+                item = iterator.value()
+                if self.get_item_path(item) in exp_set:
+                    item.setExpanded(True)
+                iterator += 1
+                
+        # 2. Restore scroll position (Scroll target item to top)
+        if top_item_path:
+            target_item = self._find_item_by_path(top_item_path)
+            if target_item:
+                self.tree.scrollToItem(target_item, QAbstractItemView.ScrollHint.PositionAtTop)
 
     def _format_duration(self, seconds):
         """Converts seconds into MM:SS string."""
@@ -748,59 +860,78 @@ class MP3Player(QWidget):
     # ------------------------
     # Tree population
     # ------------------------
-    def populate_tree(self):
+    def populate_tree(self, expanded_paths=None):
         if self._is_populating:
             return
-        try:
-            self._is_populating = True
-            self.tree.clear()
-            self.tree.setHeaderLabels(["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"])
-            all_songs = DatabaseManager.get_all_songs()
-            
-            hierarchy = {}
-            for s in all_songs:
-                g, ar, al = getattr(s, 'genre', None) or "Unknown", getattr(s, 'artist', None) or "Unknown", getattr(s, 'album', None) or "Unknown"
-                hierarchy.setdefault(g, {}).setdefault(ar, {}).setdefault(al, []).append(s)
+        self._is_populating = True
+        self._tree_state_to_restore = expanded_paths
+        self.tree.clear()
+        self.tree.setHeaderLabels(["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"])
+        
+        self.population_thread = TreePopulationThread()
+        self.population_thread.finished.connect(self._on_tree_population_finished)
+        self.population_thread.start()
 
+    def _on_tree_population_finished(self, hierarchy):
+        # Disable updates and sorting during bulk population for speed
+        self.tree.setUpdatesEnabled(False)
+        self.tree.setSortingEnabled(False)
+        
+        try:
             for genre, artists in sorted(hierarchy.items()):
-                # Genre Header Row
                 g_item = CustomTreeWidgetItem(self.tree, [genre])
                 g_item.setFirstColumnSpanned(True)
-                g_item.setForeground(0, self._COLOR_AMBER_GOLD) # Set initial text color for closed genre
+                g_item.setForeground(0, self._COLOR_AMBER_GOLD)
                 g_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'genre'})
                 
                 for artist, albums in sorted(artists.items()):
-                    # Artist Header Row
                     ar_item = CustomTreeWidgetItem(g_item, [artist])
                     ar_item.setFirstColumnSpanned(True)
-                    ar_item.setForeground(0, self._COLOR_DIM_BLUE) # Set initial text color for closed artist
+                    ar_item.setForeground(0, self._COLOR_DIM_BLUE)
                     ar_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'artist'})
+                    # Keep artist level collapsed by default
+                    ar_item.setExpanded(False)
                     
                     for album, songs in sorted(albums.items()):
-                        # Album Header Row
                         al_item = CustomTreeWidgetItem(ar_item, [album])
                         al_item.setFirstColumnSpanned(True)
-                        al_item.setForeground(0, self._COLOR_DIM_VIOLET) # Set initial text color for closed album
+                        al_item.setForeground(0, self._COLOR_DIM_VIOLET)
                         al_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'album'})
+                        # Automatically expand album level so tracks are visible when artist is opened
+                        al_item.setExpanded(True)
                         
-                        for i, s in enumerate(sorted(songs, key=self.track_sort_key)):
-                            if i % 100 == 0:  # Every 100 songs, process events
+                        # Sort songs within album once
+                        sorted_songs = sorted(songs, key=self.track_sort_key)
+                        
+                        for i, s in enumerate(sorted_songs):
+                            # Process events less frequently (every 500 tracks) to reduce overhead
+                            if i % 500 == 0:
                                 QApplication.processEvents()
                                 
                             filename = os.path.basename(s.file_path)
-                            # THE FULL DATA ROW: Every column populated
                             t_item = CustomTreeWidgetItem(al_item, [
                                 getattr(s, 'title', '') or filename,
                                 getattr(s, 'artist', ''),
-                                str(getattr(s, 'ext_1', '')),
+                                str(getattr(s, 'ext_1', '') or ''),
                                 self._format_duration(getattr(s, 'duration', 0.0)),
                                 str(getattr(s, 'rating', '0.0')),
-                                str(getattr(s, 'year', '')),
-                                getattr(s, 'comment', '')
+                                str(getattr(s, 'year', '') or ''),
+                                getattr(s, 'comment', '') or ''
                             ])
                             t_item.setData(0, Qt.ItemDataRole.UserRole, {'path': str(s.file_path), 'type': 'track'})
-                            t_item.setForeground(0, self._COLOR_OFF_WHITE) # Set text color for tracks
+                            t_item.setForeground(0, self._COLOR_OFF_WHITE)
+            
+            # Restore state if requested
+            if self._tree_state_to_restore:
+                self.restore_tree_state(self._tree_state_to_restore)
+                self._tree_state_to_restore = None
+
         finally:
+            # Re-enable updates and sorting
+            self.tree.setUpdatesEnabled(True)
+            self.tree.setSortingEnabled(True)
+            # Force A-Z sorting on the Genre/Title column (column 0)
+            self.tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
             self._is_populating = False
 
     def _update_hierarchy_item_color(self, item):
@@ -841,6 +972,20 @@ class MP3Player(QWidget):
             return
         if data.get('type') == 'track':
             self.load_track_info(data.get('path'))
+
+    def _find_item_by_path(self, path_tuple):
+        """Iterates through the tree to find an item matching a hierarchy path tuple."""
+        if not path_tuple:
+            return None
+        # Convert path_tuple to tuple if it came from JSON as a list
+        path_tuple = tuple(path_tuple)
+        iterator = QTreeWidgetItemIterator(self.tree)
+        while iterator.value():
+            item = iterator.value()
+            if self.get_item_path(item) == path_tuple:
+                return item
+            iterator += 1
+        return None
 
     def _find_track_item_by_path(self, file_path):
         """Iterates through the tree to find the track item matching a file path."""
@@ -1148,9 +1293,26 @@ class MP3Player(QWidget):
 
     def closeEvent(self, event):
         """
-        Overrides the close event to stop playback and ensure the library snapshot is updated if dirty.
+        Overrides the close event to stop playback and ensure any running background threads are stopped.
         """
         self.player.stop() # Stop any currently playing audio
+        
+        # Save tree expansion state and scroll position before closing
+        tree_state = self.save_tree_state()
+        self.cfg['tree_state'] = tree_state
+        save_config(self.cfg)
+
+        # Stop background threads
+        if self.scanner_thread and self.scanner_thread.isRunning():
+            self.scanner_thread.stop()
+            self.scanner_thread.wait()
+        
+        if self.fixer_thread and self.fixer_thread.isRunning():
+            self.fixer_thread.wait() # Fixers are usually fast enough to wait
+            
+        if self.year_fixer_thread and self.year_fixer_thread.isRunning():
+            self.year_fixer_thread.wait()
+
         self.update_library_snapshot() # This will check if dirty and save if needed
         event.accept()
 
@@ -1187,9 +1349,8 @@ class MP3Player(QWidget):
         if hierarchy_changed:
             # --- Complex Update: Hierarchy has changed ---
             print("Hierarchy changed, performing full refresh with state restoration.")
-            expanded_paths = self.save_tree_state()
-            self.populate_tree()
-            self.restore_tree_state(expanded_paths)
+            tree_state = self.save_tree_state()
+            self.populate_tree(tree_state)
         else:
             # --- Simple Update: In-place text change ---
             print("Performing in-place update.")
@@ -1211,6 +1372,9 @@ class MP3Player(QWidget):
 def main():
     # Allow Ctrl+C to stop the application gracefully
     signal.signal(signal.SIGINT, signal.SIG_DFL) 
+    
+    # Suppress verbose multimedia/decoder warnings
+    os.environ["QT_LOGGING_RULES"] = "qt.multimedia.*=false;*.warning=false"
     
     app = QApplication(sys.argv)
     app.setApplicationName("MP3 Vibe Player")
