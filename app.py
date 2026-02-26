@@ -207,13 +207,21 @@ class ClickableSlider(QSlider):
 
 class TreePopulationThread(QThread):
     finished = pyqtSignal(dict)
+    def __init__(self, music_path=None):
+        super().__init__()
+        self.music_path = music_path
 
     def run(self):
         # Retrieve all songs sorted by genre, artist, and album to speed up hierarchy building
         all_songs = DatabaseManager.get_all_songs_sorted()
         hierarchy = {}
         for s in all_songs:
-            g, ar, al = getattr(s, 'genre', None) or "Unknown", getattr(s, 'artist', None) or "Unknown", getattr(s, 'album', None) or "Unknown"
+            if self.music_path:
+                try:
+                    Path(s.file_path).relative_to(self.music_path)
+                except ValueError:
+                    continue
+            g, ar, al = getattr(s, "genre", None) or "Unknown", getattr(s, "artist", None) or "Unknown", getattr(s, "album", None) or "Unknown"
             hierarchy.setdefault(g, {}).setdefault(ar, {}).setdefault(al, []).append(s)
         self.finished.emit(hierarchy)
 
@@ -868,7 +876,7 @@ class MP3Player(QWidget):
         self.tree.clear()
         self.tree.setHeaderLabels(["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"])
         
-        self.population_thread = TreePopulationThread()
+        self.population_thread = TreePopulationThread(self.music_path)
         self.population_thread.finished.connect(self._on_tree_population_finished)
         self.population_thread.start()
 

@@ -89,49 +89,58 @@ class ScannerThread(QThread):
 
                     artist = title = album = genre = year = comment = tracknumber = None
                     duration = 0.0
+                    clean_tracknumber = ""
+                    clean_year = ""
                     
+                    # 1. Try EasyID3 for standard tags (Passing string path for robustness)
+                    path_str = str(full_path)
                     try:
-                        audio = EasyID3(full_path)
-                        artist = audio.get("artist", [""])[0]
-                        title = audio.get("title", [""])[0]
-                        album = audio.get("album", [""])[0]
-                        genre = audio.get("genre", [""])[0]
-                        year = audio.get("date", [""])[0]
-                        tracknumber = audio.get("tracknumber", [""])[0] # Original funky value
-                        
-                        # Sanitize the track number
+                        audio = EasyID3(path_str)
+                        # Safer tag extraction: don't let one missing tag crash the whole file scan
+                        artist = audio.get("artist", [None])[0] or audio.get("albumartist", [None])[0]
+                        title = audio.get("title", [None])[0]
+                        album = audio.get("album", [None])[0]
+                        genre = audio.get("genre", [None])[0]
+                        year = audio.get("date", [None])[0]
+                        tracknumber = audio.get("tracknumber", [None])[0]
+                    except Exception as e:
+                        print(f"EasyID3 read failed for {path_str}: {e}")
+
+                    # 2. Try standard MP3 for duration
+                    try:
+                        audio_file = MP3(path_str)
+                        duration = audio_file.info.length if audio_file.info else 0.0
+                    except Exception as e:
+                        print(f"MP3 duration read failed for {path_str}: {e}")
+
+                    # 3. Post-processing & Sanitization
+                    if tracknumber:
                         was_changed, clean_tracknumber = sanitize_track_number(tracknumber)
                         if was_changed:
                             tags_to_fix.append((str(full_path), clean_tracknumber))
-                        
-                        # Sanitize the year
+                    
+                    if year:
                         was_year_changed, clean_year = sanitize_year(year)
                         if was_year_changed:
                             years_to_fix.append((str(full_path), clean_year))
-                        
-                        audio_file = MP3(full_path)
-                        duration = audio_file.info.length if audio_file.info else 0.0
-                        
-                        # Snapshot updates
-                        file_count += 1
-                        file_mtime = os.path.getmtime(full_path)
-                        latest_mod_time = max(latest_mod_time, file_mtime)
-                        
-                    except Exception as e:
-                        print(f"Warning: Could not read tags for {full_path}: {e}")
-                        title = filename
-                        clean_tracknumber = "" # Ensure clean_tracknumber exists
-                        clean_year = ""      # Ensure clean_year exists
+
+                    # Snapshot updates
+                    file_count += 1
+                    file_mtime = os.path.getmtime(full_path)
+                    latest_mod_time = max(latest_mod_time, file_mtime)
+
+                    # Final fallbacks only for essential UI fields (keeping DB clean)
+                    display_title = title or full_path.stem
                     
                     song = Song(
                         file_path=str(full_path),
                         artist=artist,
-                        title=title,
+                        title=display_title,
                         album=album,
                         genre=genre,
                         year=clean_year,
                         duration=duration,
-                        ext_1=clean_tracknumber # Use the clean value for the DB
+                        ext_1=clean_tracknumber
                     )
                     song_batch.append(song)
 
@@ -147,7 +156,9 @@ class ScannerThread(QThread):
                 self.progress.emit(f"Scanning: {dirpath}")
         
         if not self.is_running:
-            print("Scan aborted by user.")
+            print("Scan aborted by user. Committing partial results...")
+            if song_batch:
+                DatabaseManager.add_songs_batch(song_batch)
             return
 
         # --- Step 3: Commit final batch and prune database ---

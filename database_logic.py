@@ -103,25 +103,25 @@ class DatabaseManager:
         conn.close()
         return [row[0] for row in rows]
 
-        @staticmethod
-        def delete_songs_by_paths(paths: list[str]):
-            """Deletes songs from the database for a given list of file paths in chunks."""
-            if not paths:
-                return
+    @staticmethod
+    def delete_songs_by_paths(paths: list[str]):
+        """Deletes songs from the database for a given list of file paths in chunks."""
+        if not paths:
+            return
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        chunk_size = 900 # Staying well under the 999 limit
+        
+        try:
+            for i in range(0, len(paths), chunk_size):
+                chunk = paths[i:i + chunk_size]
+                placeholders = ','.join('?' for _ in chunk)
+                query = f"DELETE FROM library WHERE file_path IN ({placeholders})"
+                cursor.execute(query, tuple(chunk))
             
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            chunk_size = 900 # Staying well under the 999 limit
-            
-            try:
-                for i in range(0, len(paths), chunk_size):
-                    chunk = paths[i:i + chunk_size]
-                    placeholders = ','.join('?' for _ in chunk)
-                    query = f"DELETE FROM library WHERE file_path IN ({placeholders})"
-                    cursor.execute(query, tuple(chunk))
-                
-                conn.commit()
-                print(f"Successfully pruned stale records.")
-            finally:
-                conn.close()
+            conn.commit()
+            print(f"Successfully pruned stale records.")
+        finally:
+            conn.close()
     
