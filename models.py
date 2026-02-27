@@ -44,6 +44,19 @@ class Song:
             data[f"ext_{i}"] = getattr(self, f"ext_{i}")
         return data
 
+    @property
+    def length_display(self):
+        """Returns the duration formatted as MM:SS."""
+        if not self.duration:
+            return "00:00"
+        try:
+            d = int(float(self.duration))
+            mins = d // 60
+            secs = d % 60
+            return f"{mins:02d}:{secs:02d}"
+        except (ValueError, TypeError):
+            return "00:00"
+
     @staticmethod
     def from_dict(data):
         """Creates a Song object from a dictionary loaded from the database."""

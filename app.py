@@ -17,14 +17,17 @@ Features:
 """
 import os
 import sys
+import subprocess
+import random
 from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QSlider, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QCheckBox,
-    QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,)
+    QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,
+    QMenu,)
 import signal
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint
-from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor
+from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor, QAction
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from config import load_config, save_config
 from metadata import ScannerThread, MetadataManager, PROJECT_DIR, create_library_snapshot
@@ -271,15 +274,20 @@ class VolumeControlWidget(QWidget):
 
     def set_volume_from_slider(self, value):
         if self.audio_output:
-            self.audio_output.setVolume(value / 100.0)
+            # Perceptual volume: cubic mapping feels more natural to human ears
+            perceptual_volume = (value / 100.0) ** 3
+            self.audio_output.setVolume(perceptual_volume)
 
     def update_from_audio_output(self):
         if not self.audio_output:
             return
             
-        # Update slider position
+        # Update slider position (reverse the cubic mapping)
+        vol = self.audio_output.volume()
+        slider_val = int((vol ** (1/3.0)) * 100)
+        
         self.volume_slider.blockSignals(True)
-        self.volume_slider.setValue(int(self.audio_output.volume() * 100))
+        self.volume_slider.setValue(slider_val)
         self.volume_slider.blockSignals(False)
 
         # Update icon
@@ -386,18 +394,29 @@ class MP3Player(QWidget):
         self.tree.itemExpanded.connect(self._update_hierarchy_item_color)
         self.tree.itemCollapsed.connect(self._update_hierarchy_item_color)
         
-        self.playlist_widget = QListWidget()
-        self.playlist_widget.setDragDropMode(QListWidget.DragDropMode.InternalMove)
-        
+        self.playlist_widget = QTreeWidget()
+        self.playlist_widget.setColumnCount(7)
+        self.playlist_widget.setHeaderLabels(["Title", "Artist", "Duration", "Track #", "Comment", "Genre", "Year"])
+        self.playlist_widget.header().setSectionsMovable(True)
+        self.playlist_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.playlist_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.playlist_widget.setAlternatingRowColors(True)
+        self.playlist_widget.setRootIsDecorated(False)
+        self.playlist_widget.setIndentation(0)
+        self.playlist_widget.setUniformRowHeights(True)
 
         # connect model's rowsMoved to update playlist order when drag-drop reorder happens
         self.playlist_widget.model().rowsMoved.connect(self.on_playlist_rows_moved)
 
         # connect double-click and single-click signals
         self.playlist_widget.itemDoubleClicked.connect(self.on_playlist_item_double_clicked)
-        self.playlist_widget.itemClicked.connect(self.on_playlist_item_clicked)  # 👈 ADD THIS LINE
+        self.playlist_widget.itemClicked.connect(self.on_playlist_item_clicked)
+        self.playlist_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.playlist_widget.customContextMenuRequested.connect(self.show_playlist_context_menu)
 
-        self.playlist_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_tree_context_menu)
+
         # Stacked widget for playlist and tag editor
         self.stacked_widget = QStackedWidget()
         self.stacked_widget.addWidget(self.playlist_widget)
@@ -1057,53 +1076,376 @@ class MP3Player(QWidget):
         if data.get('type') == 'track':
             path = data.get('path')
             
-            # Retrieve the full song object to get the correct title
-            song = DatabaseManager.get_song_by_path(path)
-            title = getattr(song, 'title', None) or os.path.basename(path) # Use filename as fallback
-
-            self.add_to_playlist(str(path), title)
-
-            # If checkbox is checked, immediately play it like a playlist double-click
             if self.autoplay_checkbox.isChecked():
-                # Reuse the existing playlist double-click handler
-                # Find the last added playlist item
-                last_index = self.playlist_widget.count() - 1
-                if last_index >= 0:
-                    item = self.playlist_widget.item(last_index)
-                    self.on_playlist_item_double_clicked(item)
+                # Single File Player mode: play directly without adding to playlist
+                # 1. Clear current index symbol from playlist
+                self.current_index = -1
+                self.update_playlist_ui()
+                
+                # 2. Play the file
+                title = data.get('title') or os.path.basename(path)
+                self.now_playing_label.setText(f"Playing: {title}")
+                self._marquee_text = f"Playing: {title}"
+                self._marquee_offset = 0
+                self.player.setSource(QUrl.fromLocalFile(str(path)))
+                self.player.play()
+                
+                # Load metadata info
+                self.load_track_info(str(path))
+            else:
+                # Normal mode: Add to playlist
+                # Retrieve the full song object to get the correct title
+                song = DatabaseManager.get_song_by_path(path)
+                title = getattr(song, 'title', None) or os.path.basename(path) # Use filename as fallback
+
+                self.add_to_playlist(str(path), title)
+
+    def show_tree_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if not item:
+            return
+            
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        menu = QMenu()
+        
+        if data and data.get('type') == 'track':
+            path = data.get('path')
+            
+            queue_next_act = QAction("Queue Next", self)
+            queue_next_act.triggered.connect(lambda: self.queue_next_from_tree(item))
+            menu.addAction(queue_next_act)
+            
+            refresh_act = QAction("Refresh Metadata", self)
+            refresh_act.triggered.connect(lambda: self.refresh_metadata(item))
+            menu.addAction(refresh_act)
+            
+            open_loc_act = QAction("Open File Location", self)
+            open_loc_act.triggered.connect(lambda: self.open_file_location(path))
+            menu.addAction(open_loc_act)
+            
+            copy_tags_act = QAction("Copy Tags to Clipboard", self)
+            copy_tags_act.triggered.connect(lambda: self.copy_tags_to_clipboard(path))
+            menu.addAction(copy_tags_act)
+            
+        elif data:
+            label = "Add All"
+            node_type = data.get('type')
+            if node_type == 'album': label = "Add Album"
+            elif node_type == 'artist': label = "Add Artist"
+            elif node_type == 'genre': label = "Add Genre"
+            
+            add_all_act = QAction(label, self)
+            add_all_act.triggered.connect(lambda: self.recursive_add_to_playlist(item))
+            menu.addAction(add_all_act)
+            
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def queue_next_from_tree(self, item):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get('type') != 'track':
+            return
+        path = data.get('path')
+        song = DatabaseManager.get_song_by_path(path)
+        
+        if not song:
+            title = data.get('title') or os.path.basename(path)
+            artist = duration = track = comment = genre = year = ""
+        else:
+            title = song.title or os.path.basename(path)
+            artist = song.artist or ""
+            duration = song.length_display or ""
+            track = str(song.ext_1 or "")
+            comment = song.comment or ""
+            genre = song.genre or ""
+            year = str(song.year or "")
+
+        insert_idx = self.current_index + 1
+        itm = QTreeWidgetItem([title, artist, duration, track, comment, genre, year])
+        itm.setData(0, Qt.ItemDataRole.UserRole, str(path))
+        self.playlist_widget.insertTopLevelItem(insert_idx, itm)
+        self.playlist_queue.insert(insert_idx, {'path': str(path), 'title': title})
+        
+        if self.current_index == -1 and len(self.playlist_queue) == 1:
+            self.play_index(0)
+        self.update_playlist_ui()
+
+    def recursive_add_to_playlist(self, parent_item):
+        def _add_recursive(item):
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data.get('type') == 'track':
+                path = data.get('path')
+                song = DatabaseManager.get_song_by_path(path)
+                title = getattr(song, 'title', None) or os.path.basename(path)
+                self.add_to_playlist(str(path), title)
+            for i in range(item.childCount()):
+                _add_recursive(item.child(i))
+        _add_recursive(parent_item)
+
+    def refresh_metadata(self, item):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get('type') != 'track':
+            return
+        path = data.get('path')
+        if hasattr(self, 'scanner_thread') and self.scanner_thread.isRunning():
+            QMessageBox.information(self, "Scanner Busy", "Cannot refresh metadata while a scan is in progress.")
+            return
+            
+        # Re-read metadata
+        tags, art_data = MetadataManager.load_tags_and_art(str(path))
+        # Update DB
+        song = DatabaseManager.get_song_by_path(path)
+        if song:
+            song.title = tags.get('title', song.title)
+            song.artist = tags.get('artist', song.artist)
+            song.album = tags.get('album', song.album)
+            song.ext_1 = tags.get('tracknumber', song.ext_1)
+            DatabaseManager.add_song(song)
+            
+            # Update tree item
+            item.setText(0, song.title or os.path.basename(path))
+            item.setText(1, song.artist or "")
+            item.setText(2, str(song.ext_1 or ""))
+            item.setText(3, song.length_display)
+            item.setText(4, str(song.rating))
+            item.setText(5, str(song.year or ""))
+            item.setText(6, song.comment or "")
+        
+        if self.current_mp3_path == str(path):
+            self.load_track_info(str(path))
+            
+    def open_file_location(self, path):
+        if not path: return
+        # Ensure path is string
+        path_str = str(path)
+        folder = os.path.dirname(path_str)
+        if os.path.exists(folder):
+            subprocess.run(["xdg-open", folder])
+
+    def copy_tags_to_clipboard(self, path):
+        if not path: return
+        tags, _ = MetadataManager.load_tags_and_art(str(path))
+        if tags:
+            tag_text = "\n".join([f"{k.capitalize()}: {v}" for k, v in tags.items() if v])
+            QApplication.clipboard().setText(tag_text)
+
+    def show_playlist_context_menu(self, pos):
+        selected_items = self.playlist_widget.selectedItems()
+        if not selected_items:
+            return
+        menu = QMenu()
+        
+        remove_act = QAction("Remove Selected", self)
+        remove_act.triggered.connect(self.remove_selected_from_playlist)
+        menu.addAction(remove_act)
+        
+        if len(selected_items) == 1:
+            item = selected_items[0]
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            row = self.playlist_widget.indexOfTopLevelItem(item)
+            
+            if row != self.current_index + 1:
+                move_next_act = QAction("Queue Next", self)
+                move_next_act.triggered.connect(lambda: self.move_to_queue_next(item))
+                menu.addAction(move_next_act)
+            
+            jump_act = QAction("Jump to Library", self)
+            jump_act.triggered.connect(lambda: self.jump_to_library(path))
+            menu.addAction(jump_act)
+            
+            open_loc_act = QAction("Open File Location", self)
+            open_loc_act.triggered.connect(lambda: self.open_file_location(path))
+            menu.addAction(open_loc_act)
+            
+            copy_tags_act = QAction("Copy Tags to Clipboard", self)
+            copy_tags_act.triggered.connect(lambda: self.copy_tags_to_clipboard(path))
+            menu.addAction(copy_tags_act)
+
+            menu.addSeparator()
+            
+            move_top_act = QAction("Move to Top", self)
+            move_top_act.triggered.connect(lambda: self.move_to_top(item))
+            menu.addAction(move_top_act)
+            
+            move_bottom_act = QAction("Move to Bottom", self)
+            move_bottom_act.triggered.connect(lambda: self.move_to_bottom(item))
+            menu.addAction(move_bottom_act)
+
+        menu.addSeparator()
+        
+        shuffle_all_act = QAction("Full Shuffle Playlist", self)
+        shuffle_all_act.triggered.connect(self.shuffle_playlist)
+        menu.addAction(shuffle_all_act)
+        
+        shuffle_rem_act = QAction("Randomize Remaining", self)
+        shuffle_rem_act.triggered.connect(self.shuffle_remaining)
+        menu.addAction(shuffle_rem_act)
+        
+        remove_played_act = QAction("Remove Already Played", self)
+        remove_played_act.triggered.connect(self.remove_played_tracks)
+        menu.addAction(remove_played_act)
+
+        menu.exec(self.playlist_widget.viewport().mapToGlobal(pos))
+
+    def remove_selected_from_playlist(self):
+        selected_items = self.playlist_widget.selectedItems()
+        if not selected_items: return
+        indices = sorted([self.playlist_widget.indexOfTopLevelItem(it) for it in selected_items], reverse=True)
+        for idx in indices:
+            if idx == self.current_index:
+                self.current_index = -1
+                self.player.stop()
+                self.now_playing_label.setText("Not playing")
+            elif idx < self.current_index:
+                self.current_index -= 1
+            self.playlist_widget.takeTopLevelItem(idx)
+            if 0 <= idx < len(self.playlist_queue):
+                self.playlist_queue.pop(idx)
+        self.update_playlist_ui()
+
+    def move_to_queue_next(self, item):
+        old_idx = self.playlist_widget.indexOfTopLevelItem(item)
+        new_idx = self.current_index + 1
+        if old_idx == new_idx or new_idx >= self.playlist_widget.topLevelItemCount(): return
+        
+        entry = self.playlist_queue.pop(old_idx)
+        self.playlist_queue.insert(new_idx, entry)
+        it = self.playlist_widget.takeTopLevelItem(old_idx)
+        self.playlist_widget.insertTopLevelItem(new_idx, it)
+        
+        # Re-sync current_index
+        cur_path = self.player.source().toLocalFile()
+        if cur_path:
+            for i, e in enumerate(self.playlist_queue):
+                if e['path'] == cur_path:
+                    self.current_index = i
+                    break
+        self.update_playlist_ui()
+
+    def jump_to_library(self, path):
+        item = self._find_track_item_by_path(path)
+        if item:
+            self.tree.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtTop)
+            self.tree.setCurrentItem(item)
+
+    def move_to_top(self, item):
+        old_idx = self.playlist_widget.indexOfTopLevelItem(item)
+        if old_idx == 0: return
+        entry = self.playlist_queue.pop(old_idx)
+        self.playlist_queue.insert(0, entry)
+        it = self.playlist_widget.takeTopLevelItem(old_idx)
+        self.playlist_widget.insertTopLevelItem(0, it)
+        # Re-sync current_index
+        cur_path = self.player.source().toLocalFile()
+        if cur_path:
+            for i, e in enumerate(self.playlist_queue):
+                if e['path'] == cur_path:
+                    self.current_index = i
+                    break
+        self.update_playlist_ui()
+
+    def move_to_bottom(self, item):
+        old_idx = self.playlist_widget.indexOfTopLevelItem(item)
+        last_idx = self.playlist_widget.topLevelItemCount() - 1
+        if old_idx == last_idx: return
+        entry = self.playlist_queue.pop(old_idx)
+        self.playlist_queue.append(entry)
+        it = self.playlist_widget.takeTopLevelItem(old_idx)
+        self.playlist_widget.addTopLevelItem(it)
+        # Re-sync current_index
+        cur_path = self.player.source().toLocalFile()
+        if cur_path:
+            for i, e in enumerate(self.playlist_queue):
+                if e['path'] == cur_path:
+                    self.current_index = i
+                    break
+        self.update_playlist_ui()
+
+    def shuffle_playlist(self):
+        random.shuffle(self.playlist_queue)
+        self.current_index = -1
+        # Find new current_index
+        cur_path = self.player.source().toLocalFile()
+        if cur_path:
+            for i, e in enumerate(self.playlist_queue):
+                if e['path'] == cur_path:
+                    self.current_index = i
+                    break
+        self._rebuild_playlist_widget()
+
+    def shuffle_remaining(self):
+        if self.current_index + 1 < len(self.playlist_queue):
+            remaining = self.playlist_queue[self.current_index+1:]
+            random.shuffle(remaining)
+            self.playlist_queue[self.current_index+1:] = remaining
+            self._rebuild_playlist_widget()
+
+    def remove_played_tracks(self):
+        if self.current_index <= 0: return
+        # Remove tracks from 0 to current_index - 1
+        for _ in range(self.current_index):
+            self.playlist_queue.pop(0)
+            self.playlist_widget.takeTopLevelItem(0)
+        self.current_index = 0
+        self.update_playlist_ui()
+
+    def _rebuild_playlist_widget(self):
+        self.playlist_widget.clear()
+        for entry in self.playlist_queue:
+            path = entry['path']
+            song = DatabaseManager.get_song_by_path(path)
+            if not song:
+                title = entry['title']
+                artist = duration = track = comment = genre = year = ""
+            else:
+                title = song.title or entry['title']
+                artist = song.artist or ""
+                duration = song.length_display or ""
+                track = str(song.ext_1 or "")
+                comment = song.comment or ""
+                genre = song.genre or ""
+                year = str(song.year or "")
+
+            itm = QTreeWidgetItem([title, artist, duration, track, comment, genre, year])
+            itm.setData(0, Qt.ItemDataRole.UserRole, path)
+            self.playlist_widget.addTopLevelItem(itm)
+        self.update_playlist_ui()
 
 
     # ------------------------
     # Playlist handling
     # ------------------------
     def add_to_playlist(self, fullpath, title=None):
-        if not title:
-            title = os.path.basename(fullpath)
-        # create item
-        itm = QListWidgetItem(title)
-        itm.setData(Qt.ItemDataRole.UserRole, fullpath)
-        self.playlist_widget.addItem(itm)
+        song = DatabaseManager.get_song_by_path(fullpath)
+        if not song:
+            title = title or os.path.basename(fullpath)
+            artist = duration = track = comment = genre = year = ""
+        else:
+            title = song.title or os.path.basename(fullpath)
+            artist = song.artist or ""
+            duration = song.length_display or ""
+            track = str(song.ext_1 or "")
+            comment = song.comment or ""
+            genre = song.genre or ""
+            year = str(song.year or "")
+
+        itm = QTreeWidgetItem([title, artist, duration, track, comment, genre, year])
+        itm.setData(0, Qt.ItemDataRole.UserRole, fullpath)
+        self.playlist_widget.addTopLevelItem(itm)
+        
         self.playlist_queue.append({'path': fullpath, 'title': title})
         # if first item, start playback
         if len(self.playlist_queue) == 1:
             self.play_index(0)
 
     def on_playlist_item_double_clicked(self, item):
-        idx = self.playlist_widget.row(item)
+        idx = self.playlist_widget.indexOfTopLevelItem(item)
         self.play_index(idx)
         # load tags, album art, rating for selected track
-        self.load_track_info(item.data(Qt.ItemDataRole.UserRole))
+        self.load_track_info(item.data(0, Qt.ItemDataRole.UserRole))
         
     def on_playlist_item_clicked(self, item):
         """Load tag info when a playlist item is single-clicked."""
-        # Grab the file path stored in the item (for older approach)
-        path = item.data(Qt.ItemDataRole.UserRole)
-
-        # Or via playlist_queue
-        index = self.playlist_widget.row(item)
-        if 0 <= index < len(self.playlist_queue):
-            path = self.playlist_queue[index]['path']
-
+        path = item.data(0, Qt.ItemDataRole.UserRole)
         if path:
             self.load_track_info(path)
 
@@ -1115,10 +1457,10 @@ class MP3Player(QWidget):
 
         # Rebuild queue from widget items
         new_queue = []
-        for i in range(self.playlist_widget.count()):
-            it = self.playlist_widget.item(i)
-            path = it.data(Qt.ItemDataRole.UserRole)
-            text = it.text()
+        for i in range(self.playlist_widget.topLevelItemCount()):
+            it = self.playlist_widget.topLevelItem(i)
+            path = it.data(0, Qt.ItemDataRole.UserRole)
+            text = it.text(0)
             # Strip symbol if present
             if text.startswith("▶ "):
                 text = text[2:]
@@ -1138,25 +1480,28 @@ class MP3Player(QWidget):
 
     def update_playlist_ui(self):
         # visually mark current track
-        for i in range(self.playlist_widget.count()):
-            it = self.playlist_widget.item(i)
-            text = self.playlist_queue[i]['title']  # always start fresh
+        for i in range(self.playlist_widget.topLevelItemCount()):
+            it = self.playlist_widget.topLevelItem(i)
+            if i >= len(self.playlist_queue): 
+                continue
+                
+            text = self.playlist_queue[i]['title']
             if i == self.current_index:
                 text = f"▶ {text}"
                 # Always load tag info for this track
                 self.load_track_info(self.playlist_queue[i]['path'])
-                it.setBackground(Qt.GlobalColor.blue)
-                font = it.font()
-                font.setBold(True)
-                it.setFont(font)
+                for col in range(self.playlist_widget.columnCount()):
+                    it.setBackground(col, QColor(0, 120, 215, 150)) # Highlight color
+                    font = it.font(col)
+                    font.setBold(True)
+                    it.setFont(col, font)
             else:
-                # Always load tag info for this track
-                self.load_track_info(self.playlist_queue[i]['path'])
-                it.setBackground(Qt.GlobalColor.transparent)
-                font = it.font()
-                font.setBold(False)
-                it.setFont(font)
-            it.setText(text)
+                for col in range(self.playlist_widget.columnCount()):
+                    it.setData(col, Qt.ItemDataRole.BackgroundRole, None)
+                    font = it.font(col)
+                    font.setBold(False)
+                    it.setFont(col, font)
+            it.setText(0, text)
 
     # ------------------------
     # Playback controls
