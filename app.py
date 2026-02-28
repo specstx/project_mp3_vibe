@@ -1886,8 +1886,14 @@ class MP3Player(QMainWindow):
                 self._play_counted = True
                 path = self.player.source().toLocalFile()
                 if path:
-                    DatabaseManager.increment_play_count(path)
-                    print(f"Metric: Play count incremented for {Path(path).name}")
+                    # SOVEREIGN: Convert back to relative path for DB lookup
+                    try:
+                        rel_path = os.path.relpath(path, self.music_path)
+                        DatabaseManager.increment_play_count(rel_path)
+                        print(f"Metric: Play count incremented for {rel_path}")
+                    except ValueError:
+                        # Fallback if path isn't under music_path for some reason
+                        DatabaseManager.increment_play_count(path)
 
         # update time label
         cur = int(pos / 1000)
