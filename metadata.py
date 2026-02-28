@@ -42,7 +42,7 @@ class ScannerThread(QThread):
     def run(self):
         # --- Step 1: Get initial state ---
         db_paths = set(DatabaseManager.get_all_filepaths())
-        found_paths = set()
+        found_rel_paths = set()
         
         tree = {} # This is for the old tree logic, can be removed later
         song_batch = []
@@ -85,7 +85,9 @@ class ScannerThread(QThread):
                         break
 
                     full_path = Path(os.path.join(dirpath, filename))
-                    found_paths.add(str(full_path)) # Add found path to our set
+                    # SOVEREIGN: Calculate path relative to library root
+                    rel_file_path = full_path.relative_to(self.root_path)
+                    found_rel_paths.add(str(rel_file_path))
 
                     artist = title = album = genre = year = comment = tracknumber = None
                     duration = 0.0
@@ -117,12 +119,12 @@ class ScannerThread(QThread):
                     if tracknumber:
                         was_changed, clean_tracknumber = sanitize_track_number(tracknumber)
                         if was_changed:
-                            tags_to_fix.append((str(full_path), clean_tracknumber))
+                            tags_to_fix.append((str(rel_file_path), clean_tracknumber))
                     
                     if year:
                         was_year_changed, clean_year = sanitize_year(year)
                         if was_year_changed:
-                            years_to_fix.append((str(full_path), clean_year))
+                            years_to_fix.append((str(rel_file_path), clean_year))
 
                     # Snapshot updates
                     file_count += 1
@@ -133,13 +135,14 @@ class ScannerThread(QThread):
                     display_title = title or full_path.stem
                     
                     song = Song(
-                        file_path=str(full_path),
+                        file_path=str(rel_file_path), # SOVEREIGN: Relative path in DB
                         artist=artist,
                         title=display_title,
                         album=album,
                         genre=genre,
                         year=clean_year,
                         duration=duration,
+                        is_present=1, # It's here
                         ext_1=clean_tracknumber
                     )
                     song_batch.append(song)
@@ -161,14 +164,14 @@ class ScannerThread(QThread):
                 DatabaseManager.add_songs_batch(song_batch)
             return
 
-        # --- Step 3: Commit final batch and prune database ---
+        # --- Step 3: Commit final batch and mark stale tracks offline ---
         if song_batch:
             DatabaseManager.add_songs_batch(song_batch)
         
-        stale_paths = db_paths - found_paths
+        stale_paths = db_paths - found_rel_paths
         if stale_paths:
-            print(f"Pruning {len(stale_paths)} stale paths...")
-            DatabaseManager.delete_songs_by_paths(list(stale_paths))
+            print(f"Marking {len(stale_paths)} tracks as offline...")
+            DatabaseManager.mark_offline(list(stale_paths))
 
         # --- Step 4: Finalize and emit finished signal ---
         try:
@@ -218,10 +221,11 @@ class MetadataManager:
 
     # Extracted from MP3Player.save_tags
     @staticmethod
-    def save_tags(path, tag_data):
+    def save_tags(abs_path, tag_data, rel_path=None):
         """Saves standard ID3 tags to a file and updates the database."""
+        db_path = rel_path or abs_path
         try:
-            audio = EasyID3(path)
+            audio = EasyID3(abs_path)
             for tag, text in tag_data.items():
                 audio[tag] = text
             audio.save()
@@ -231,13 +235,55 @@ class MetadataManager:
                 tag_data['ext_1'] = tag_data.pop('tracknumber')
 
             # Update the database
-            song = Song(file_path=path, **tag_data) # Create a Song object from updated tags
+            song = Song(file_path=db_path, **tag_data) # Create a Song object from updated tags
             DatabaseManager.add_song(song) # This will update existing entry or add new one
 
             return True
         except Exception as e:
-            print(f"Failed to save tags for {path}: {e}")
+            print(f"Failed to save tags for {abs_path}: {e}")
             return False
+
+    @staticmethod
+    def get_extended_tags(path):
+        """Loads all available ID3 tags from the file for deep editing."""
+        all_tags = {}
+        try:
+            audio = ID3(path)
+            for key, frame in audio.items():
+                # Extract text if possible, otherwise skip binary frames
+                if hasattr(frame, 'text') and frame.text:
+                    all_tags[key] = str(frame.text[0])
+                elif hasattr(frame, 'url'):
+                    all_tags[key] = str(frame.url)
+        except Exception as e:
+            print(f"Failed to load extended tags: {e}")
+        return all_tags
+
+    @staticmethod
+    def get_technical_properties(path):
+        """Extracts technical file properties (bitrate, sample rate, etc.)."""
+        props = {
+            "File Name": Path(path).name,
+            "File Path": path,
+            "File Size": f"{os.path.getsize(path) / (1024*1024):.2f} MB"
+        }
+        try:
+            audio = MP3(path)
+            info = audio.info
+            props.update({
+                "Format": "MPEG-1 Layer 3",
+                "Bitrate": f"{int(info.bitrate / 1000)} kbps",
+                "Sample Rate": f"{info.sample_rate} Hz",
+                "Channels": "Stereo" if info.channels == 2 else "Mono",
+                "Length": f"{int(info.length // 60)}:{int(info.length % 60):02d}",
+                "Encoder": getattr(info, 'encoder_info', 'Unknown')
+            })
+            if info.bitrate_mode:
+                mode_map = {1: "CBR", 2: "VBR", 3: "ABR"}
+                props["Bitrate Mode"] = mode_map.get(info.bitrate_mode.value, "Unknown")
+        except Exception as e:
+            print(f"Failed to load technical properties: {e}")
+        return props
 
     # Extracted from YinYangRatingWidget.load_rating
     @staticmethod
@@ -256,10 +302,11 @@ class MetadataManager:
 
     # Extracted from YinYangRatingWidget._make_click_handler
     @staticmethod
-    def save_rating(path, rating):
+    def save_rating(abs_path, rating, rel_path=None):
         """Saves the 0-5 rating to the POPM tag of the file at the given path and updates the database."""
+        db_path = rel_path or abs_path
         try:
-            audio = MP3(path)
+            audio = MP3(abs_path)
             popms = audio.tags.getall("POPM") if audio.tags else []
 
             if popms:
@@ -275,16 +322,16 @@ class MetadataManager:
             audio.save()
 
             # Update the database
-            song = DatabaseManager.get_song_by_path(path)
+            song = DatabaseManager.get_song_by_path(db_path)
             if song:
                 song.rating = rating
                 DatabaseManager.add_song(song) # Add_song will update the existing entry
             else:
-                print(f"Warning: Song not found in database for path: {path}. Cannot update rating in DB.")
+                print(f"Warning: Song not found in database for path: {db_path}. Cannot update rating in DB.")
 
             return True
         except Exception as e:
-            print(f"Failed to save rating for {path}: {e}")
+            print(f"Failed to save rating for {abs_path}: {e}")
             return False
     
 # Utility function to create a library snapshot

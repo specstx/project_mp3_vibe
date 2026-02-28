@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QSlider, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QCheckBox,
     QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,
-    QMenu,)
+    QMenu, QMainWindow, QMenuBar)
 import signal
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor, QAction
@@ -70,9 +70,10 @@ class YinYangRatingWidget(QWidget):
 
         # initialize visual state immediately
         self._update_icons()
-    def load_rating(self, path):
-        self._current_path = path
-        self.current_rating = MetadataManager.load_rating(path) 
+    def load_rating(self, abs_path, rel_path=None):
+        self._current_abs_path = abs_path
+        self._current_rel_path = rel_path or abs_path
+        self.current_rating = MetadataManager.load_rating(abs_path) 
         self._update_icons()
 
     def _update_icons(self, hover_index=None, hover_half=False):
@@ -114,16 +115,16 @@ class YinYangRatingWidget(QWidget):
             self.current_rating = index + 0.5 if half else index + 1
             self._update_icons()
 
-            path = getattr(self, "_current_path", None)
+            abs_path = getattr(self, "_current_abs_path", None)
+            rel_path = getattr(self, "_current_rel_path", None)
             
             # Call MetadataManager to save the new rating
-            if path and MetadataManager.save_rating(path, self.current_rating):
-                self.rating_saved.emit(path, self.current_rating) # Emit signal with path and new rating
+            if abs_path and MetadataManager.save_rating(abs_path, self.current_rating, rel_path=rel_path):
+                self.rating_saved.emit(rel_path, self.current_rating) # Emit signal with relative path
             else:
                 # If save fails, revert the icons and show a message
-                self.current_rating = MetadataManager.load_rating(path) 
+                self.current_rating = MetadataManager.load_rating(abs_path) 
                 self._update_icons()
-                QMessageBox.warning(self, "Error", "Failed to save rating. Check console for details.")
                 QMessageBox.warning(self, "Error", "Failed to save rating. Check console for details.")
         
         return handler
@@ -207,27 +208,6 @@ class ClickableSlider(QSlider):
             self.setValue(new_val)
             self.sliderReleased.emit() # trigger existing handler
         super().mousePressEvent(event)
-
-class TreePopulationThread(QThread):
-    finished = pyqtSignal(dict)
-    def __init__(self, music_path=None):
-        super().__init__()
-        self.music_path = music_path
-
-    def run(self):
-        # Retrieve all songs sorted by genre, artist, and album to speed up hierarchy building
-        all_songs = DatabaseManager.get_all_songs_sorted()
-        hierarchy = {}
-        for s in all_songs:
-            if self.music_path:
-                try:
-                    Path(s.file_path).relative_to(self.music_path)
-                except ValueError:
-                    continue
-            g, ar, al = getattr(s, "genre", None) or "Unknown", getattr(s, "artist", None) or "Unknown", getattr(s, "album", None) or "Unknown"
-            hierarchy.setdefault(g, {}).setdefault(ar, {}).setdefault(al, []).append(s)
-        self.finished.emit(hierarchy)
-
 
 # ------------------------
 # Custom Volume Control
@@ -322,10 +302,48 @@ class VolumeControlWidget(QWidget):
         self.slider_popup.move(point.x(), point.y() - self.slider_popup.height())
         self.slider_popup.show()
 
+# --- Sovereign: TreePopulationThread needs to use the relative path logic ---
+class TreePopulationThread(QThread):
+    finished = pyqtSignal(dict)
+
+    def __init__(self, music_path):
+        super().__init__()
+        self.music_path = music_path
+
+    def run(self):
+        # Fetch only songs that are currently 'Present' on the located drive
+        songs = DatabaseManager.get_present_songs()
+        
+        hierarchy = {}
+        for s in songs:
+            g, ar, al = getattr(s, "genre", None) or "Unknown", getattr(s, "artist", None) or "Unknown", getattr(s, "album", None) or "Unknown"
+            
+            if g not in hierarchy: hierarchy[g] = {}
+            if ar not in hierarchy[g]: hierarchy[g][ar] = {}
+            if al not in hierarchy[g][ar]: hierarchy[g][ar][al] = []
+            
+            hierarchy[g][ar][al].append(s)
+            
+        # Sort tracks within each album
+        for g in hierarchy:
+            for ar in hierarchy[g]:
+                for al in hierarchy[g][ar]:
+                    hierarchy[g][ar][al].sort(key=self.track_sort_key)
+                    
+        self.finished.emit(hierarchy)
+
+    def track_sort_key(self, song):
+        try:
+            track_str = str(getattr(song, 'ext_1', '0') or '0')
+            track_part = track_str.split('/')[0]
+            return int(track_part)
+        except (ValueError, TypeError):
+            return 0
+
 # ------------------------
 # Main Window
 # ------------------------
-class MP3Player(QWidget):
+class MP3Player(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MP3 Player")
@@ -341,6 +359,12 @@ class MP3Player(QWidget):
         self.current_index = -1
         self.current_mp3_path = None
         self._is_populating = False
+        self._play_counted = False  # Track if current song has been counted for metrics
+        
+        # Play Session Tracking
+        self._current_session_path = None
+        self._current_session_start_pos = 0 
+        self._current_session_max_pos = 0 # Track furthest point reached in song
 
         # Color constants
         self._COLOR_OFF_WHITE = QColor("#E0E0E0")
@@ -371,6 +395,9 @@ class MP3Player(QWidget):
         # Custom volume control
         self.volume_control = VolumeControlWidget()
         self.volume_control.setAudioOutput(self.audio_output)
+
+        # Menu Bar
+        self.init_menubar()
 
         # UI pieces
         self.tree = QTreeWidget()
@@ -535,6 +562,237 @@ class MP3Player(QWidget):
         # Stagger the initial load and scan to allow the UI to show up first
         QTimer.singleShot(100, self.initial_load_and_scan)
 
+    def init_menubar(self):
+        menubar = self.menuBar()
+        
+        # 1. File (Data Lifecycle)
+        file_menu = menubar.addMenu("File")
+        
+        scan_sideshow_action = QAction("Scan SideShow", self)
+        scan_sideshow_action.triggered.connect(self.scan_sideshow)
+        file_menu.addAction(scan_sideshow_action)
+        
+        add_folder_action = QAction("Add Folder to Collection", self)
+        add_folder_action.triggered.connect(self.add_folder_to_collection)
+        file_menu.addAction(add_folder_action)
+        
+        db_stats_action = QAction("Database Statistics", self)
+        db_stats_action.triggered.connect(self.show_db_stats)
+        file_menu.addAction(db_stats_action)
+        
+        clear_view_action = QAction("Clear View", self)
+        clear_view_action.triggered.connect(self.clear_active_view)
+        file_menu.addAction(clear_view_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # 2. Edit (Surgical Metadata)
+        edit_menu = menubar.addMenu("Edit")
+        
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.triggered.connect(self.undo_tag_change)
+        edit_menu.addAction(undo_action)
+        
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut("Ctrl+Y")
+        redo_action.triggered.connect(self.redo_tag_change)
+        edit_menu.addAction(redo_action)
+        
+        extended_tags_action = QAction("Extended Tags", self)
+        extended_tags_action.triggered.connect(self.show_extended_tags)
+        edit_menu.addAction(extended_tags_action)
+        
+        properties_action = QAction("Properties", self)
+        properties_action.setShortcut("Alt+Return")
+        properties_action.triggered.connect(self.show_file_properties)
+        edit_menu.addAction(properties_action)
+
+        # 3. Tools (Mass Operations)
+        tools_menu = menubar.addMenu("Tools")
+        
+        case_conv_action = QAction("Case Conversion", self)
+        case_conv_action.triggered.connect(self.tool_case_conversion)
+        tools_menu.addAction(case_conv_action)
+        
+        char_replace_action = QAction("Character Replacement", self)
+        char_replace_action.triggered.connect(self.tool_char_replacement)
+        tools_menu.addAction(char_replace_action)
+        
+        autonumber_action = QAction("Autonumbering Wizard", self)
+        autonumber_action.triggered.connect(self.tool_autonumbering)
+        tools_menu.addAction(autonumber_action)
+        
+        integrity_action = QAction("Integrity Check", self)
+        integrity_action.triggered.connect(self.tool_integrity_check)
+        tools_menu.addAction(integrity_action)
+
+        # 4. Tagger (Automated Logic)
+        tagger_menu = menubar.addMenu("Tagger")
+        
+        musicbrainz_action = QAction("MusicBrainz Lookup", self)
+        musicbrainz_action.triggered.connect(self.tagger_musicbrainz_lookup)
+        tagger_menu.addAction(musicbrainz_action)
+        
+        cluster_action = QAction("Cluster Files", self)
+        cluster_action.triggered.connect(self.tagger_cluster_files)
+        tagger_menu.addAction(cluster_action)
+        
+        fingerprint_action = QAction("Scan Fingerprints (AcoustID)", self)
+        fingerprint_action.triggered.connect(self.tagger_scan_fingerprints)
+        tagger_menu.addAction(fingerprint_action)
+
+        # 5. View (Modular UI Toggles)
+        view_menu = menubar.addMenu("View")
+        
+        eq_action = QAction("Equalizer", self, checkable=True)
+        eq_action.triggered.connect(self.toggle_equalizer)
+        view_menu.addAction(eq_action)
+        
+        waveform_action = QAction("Waveform Viewer", self, checkable=True)
+        waveform_action.triggered.connect(self.toggle_waveform)
+        view_menu.addAction(waveform_action)
+        
+        visualizer_action = QAction("Visualizer", self, checkable=True)
+        visualizer_action.triggered.connect(self.toggle_visualizer)
+        view_menu.addAction(visualizer_action)
+        
+        view_menu.addSeparator()
+        
+        lib_tree_action = QAction("Library Tree / Playlist", self)
+        lib_tree_action.triggered.connect(self.toggle_views)
+        view_menu.addAction(lib_tree_action)
+
+        # 6. Sync (Mirror & Backup)
+        sync_menu = menubar.addMenu("Sync")
+        
+        audit_mirror_action = QAction("Audit Mirror", self)
+        audit_mirror_action.triggered.connect(self.sync_audit_mirror)
+        sync_menu.addAction(audit_mirror_action)
+        
+        hash_verif_action = QAction("Hash Verification", self)
+        hash_verif_action.triggered.connect(self.sync_hash_verification)
+        sync_menu.addAction(hash_verif_action)
+        
+        mirror_ext_action = QAction("Mirror to External (Sovereign Sync)", self)
+        mirror_ext_action.triggered.connect(self.sync_now)
+        sync_menu.addAction(mirror_ext_action)
+
+    # --- Menu Action Stubs ---
+    def scan_sideshow(self):
+        """Trigger Sovereign Sync to index the library."""
+        from sovereign_sync import SovereignSync
+        # Pointing to the Master (SideShow) to sync to Mirror
+        reply = QMessageBox.question(
+            self, "Scan SideShow", 
+            "Audit SideShow (Master) and sync to External (Mirror)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.now_playing_label.setText("Auditing Mirror...")
+            QApplication.processEvents()
+            try:
+                # We can refine SovereignSync to allow 'Master -> Mirror' only runs later
+                engine = SovereignSync()
+                engine.run()
+                QMessageBox.information(self, "Audit Complete", "Mirror sync/audit finished.")
+            except Exception as e:
+                QMessageBox.critical(self, "Audit Error", f"Error: {e}")
+            finally:
+                self.now_playing_label.setText("Ready")
+
+    def add_folder_to_collection(self): pass
+    
+    def show_db_stats(self):
+        """Displays database statistics in a formatted dialog."""
+        stats = DatabaseManager.get_statistics()
+        
+        # Calculate human readable duration
+        td = stats['total_duration']
+        days = int(td // 86400)
+        hours = int((td % 86400) // 3600)
+        minutes = int((td % 3600) // 60)
+        
+        # Calculate file size estimate (very rough based on 5MB average or we can do a real sum if needed)
+        # For now, let's just stick to the counts.
+        
+        msg = (
+            f"<b>Library Overview</b><br><br>"
+            f"Total Tracks: {stats['total_tracks']:,}<br>"
+            f"Total Playtime: {days}d {hours}h {minutes}m<br>"
+            f"Top Genre: {stats['top_genre']}<br>"
+            f"Top Artist: {stats['top_artist']}<br><br>"
+            f"<b>Health & Ratings</b><br>"
+            f"Missing Metadata: {stats['missing_metadata']}<br>"
+            f"Highly Rated (4.0+): {stats['top_rated_count']}"
+        )
+        
+        QMessageBox.information(self, "Database Statistics", msg)
+
+    def clear_active_view(self):
+        """Clears the active playlist."""
+        if self.playlist_queue:
+            reply = QMessageBox.question(
+                self, "Clear View", "Clear the current playlist?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.playlist_queue = []
+                self.current_index = -1
+                self.playlist_widget.clear()
+                self.update_playlist_ui()
+                self.now_playing_label.setText("Playlist Cleared")
+    
+    def undo_tag_change(self): pass
+    def redo_tag_change(self): pass
+    def show_extended_tags(self): pass
+    def show_file_properties(self): pass
+    
+    def tool_case_conversion(self): pass
+    def tool_char_replacement(self): pass
+    def tool_autonumbering(self): pass
+    def tool_integrity_check(self): pass
+    
+    def tagger_musicbrainz_lookup(self): pass
+    def tagger_cluster_files(self): pass
+    def tagger_scan_fingerprints(self): pass
+    
+    def toggle_equalizer(self, checked): pass
+    def toggle_waveform(self, checked): pass
+    def toggle_visualizer(self, checked): pass
+    
+    def sync_audit_mirror(self): pass
+    def sync_hash_verification(self): pass
+
+    def sync_now(self):
+        """Invoke the Sovereign Sync Engine."""
+        from sovereign_sync import SovereignSync
+        
+        # We can confirm with user first as per the rule
+        reply = QMessageBox.question(
+            self, "Sovereign Sync", 
+            "Start Sovereign Sync (Parking -> Master -> Mirror)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.now_playing_label.setText("Syncing...")
+            QApplication.processEvents()
+            
+            try:
+                # Initialize engine with defaults
+                engine = SovereignSync()
+                engine.run()
+                QMessageBox.information(self, "Sync Complete", "Sovereign Sync finished successfully.")
+            except Exception as e:
+                QMessageBox.critical(self, "Sync Error", f"An error occurred during sync: {e}")
+            finally:
+                self.now_playing_label.setText("Ready")
+
     def _mark_snapshot_dirty(self):
         self._snapshot_is_dirty = True
         print("Snapshot marked as dirty.") # For debugging
@@ -592,6 +850,16 @@ class MP3Player(QWidget):
             self.start_scan(background=True)
 
     def build_layout(self):
+        # Main layout container
+        main_container = QWidget()
+        self.setCentralWidget(main_container)
+        main_layout = QHBoxLayout(main_container)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(0)
+
+        # Left-hand tree
+        main_layout.addWidget(self.tree)
+
         # -----------------------------
         # Right-hand panel layout
         # -----------------------------
@@ -679,10 +947,8 @@ class MP3Player(QWidget):
         splitter.addWidget(right_frame)
         splitter.setSizes([680, 320])
 
-        # Main layout
-        main_l = QHBoxLayout()
-        main_l.addWidget(splitter)
-        self.setLayout(main_l)
+        # Add splitter to main layout
+        main_layout.addWidget(splitter)
 
     def _build_tree_from_songs(self, songs, music_path):
         tree = {}
@@ -895,6 +1161,7 @@ class MP3Player(QWidget):
         self.tree.clear()
         self.tree.setHeaderLabels(["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"])
         
+        # SOVEREIGN: We only populate with 'Present' songs, but history is kept
         self.population_thread = TreePopulationThread(self.music_path)
         self.population_thread.finished.connect(self._on_tree_population_finished)
         self.population_thread.start()
@@ -1036,18 +1303,20 @@ class MP3Player(QWidget):
     
     # app.py: Inside the MP3Player class
 
-    def load_track_info(self, path):
+    def load_track_info(self, rel_path):
         """Load tags, album art, and rating for any track"""
         # Fix: QPixmap and Qt must be imported here to be available in the 'else' block and for scaling
         from PyQt6.QtGui import QPixmap 
         from PyQt6.QtCore import Qt 
         
-        if not path:
+        if not rel_path:
             return
-        self.current_mp3_path = path
+            
+        abs_path = os.path.join(self.music_path, rel_path)
+        self.current_mp3_path = rel_path
         
         # Call MetadataManager to get tags and art data
-        tags, art_data = MetadataManager.load_tags_and_art(path)
+        tags, art_data = MetadataManager.load_tags_and_art(abs_path)
 
         # Tags (Update the QLineEdit widgets)
         for tag, widget in self.tag_fields.items():
@@ -1067,14 +1336,14 @@ class MP3Player(QWidget):
         
         # Rating 
         if hasattr(self, "rating_widget"):
-            self.rating_widget._current_path = path
-            self.rating_widget.load_rating(path)
+            self.rating_widget.load_rating(abs_path, rel_path=rel_path)
     def on_tree_item_double_clicked(self, item, col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data:
             return
         if data.get('type') == 'track':
-            path = data.get('path')
+            rel_path = data.get('path')
+            abs_path = os.path.join(self.music_path, rel_path)
             
             if self.autoplay_checkbox.isChecked():
                 # Single File Player mode: play directly without adding to playlist
@@ -1083,22 +1352,29 @@ class MP3Player(QWidget):
                 self.update_playlist_ui()
                 
                 # 2. Play the file
-                title = data.get('title') or os.path.basename(path)
+                title = data.get('title') or os.path.basename(rel_path)
                 self.now_playing_label.setText(f"Playing: {title}")
                 self._marquee_text = f"Playing: {title}"
                 self._marquee_offset = 0
-                self.player.setSource(QUrl.fromLocalFile(str(path)))
+
+                # SOVEREIGN: Record session
+                self._record_current_session()
+                self._current_session_path = rel_path
+                self._current_session_max_pos = 0
+                self._play_counted = False
+
+                self.player.setSource(QUrl.fromLocalFile(abs_path))
                 self.player.play()
                 
                 # Load metadata info
-                self.load_track_info(str(path))
+                self.load_track_info(rel_path)
             else:
                 # Normal mode: Add to playlist
                 # Retrieve the full song object to get the correct title
-                song = DatabaseManager.get_song_by_path(path)
-                title = getattr(song, 'title', None) or os.path.basename(path) # Use filename as fallback
+                song = DatabaseManager.get_song_by_path(rel_path)
+                title = getattr(song, 'title', None) or os.path.basename(rel_path) # Use filename as fallback
 
-                self.add_to_playlist(str(path), title)
+                self.add_to_playlist(rel_path, title)
 
     def show_tree_context_menu(self, pos):
         item = self.tree.itemAt(pos)
@@ -1185,15 +1461,16 @@ class MP3Player(QWidget):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data or data.get('type') != 'track':
             return
-        path = data.get('path')
+        rel_path = data.get('path')
+        abs_path = os.path.join(self.music_path, rel_path)
         if hasattr(self, 'scanner_thread') and self.scanner_thread.isRunning():
             QMessageBox.information(self, "Scanner Busy", "Cannot refresh metadata while a scan is in progress.")
             return
             
         # Re-read metadata
-        tags, art_data = MetadataManager.load_tags_and_art(str(path))
+        tags, art_data = MetadataManager.load_tags_and_art(abs_path)
         # Update DB
-        song = DatabaseManager.get_song_by_path(path)
+        song = DatabaseManager.get_song_by_path(rel_path)
         if song:
             song.title = tags.get('title', song.title)
             song.artist = tags.get('artist', song.artist)
@@ -1213,17 +1490,18 @@ class MP3Player(QWidget):
         if self.current_mp3_path == str(path):
             self.load_track_info(str(path))
             
-    def open_file_location(self, path):
-        if not path: return
-        # Ensure path is string
-        path_str = str(path)
-        folder = os.path.dirname(path_str)
+    def open_file_location(self, rel_path):
+        if not rel_path: return
+        abs_path = os.path.join(self.music_path, rel_path)
+        folder = os.path.dirname(abs_path)
         if os.path.exists(folder):
+            # Use xdg-open for Linux portability
             subprocess.run(["xdg-open", folder])
 
-    def copy_tags_to_clipboard(self, path):
-        if not path: return
-        tags, _ = MetadataManager.load_tags_and_art(str(path))
+    def copy_tags_to_clipboard(self, rel_path):
+        if not rel_path: return
+        abs_path = os.path.join(self.music_path, rel_path)
+        tags, _ = MetadataManager.load_tags_and_art(abs_path)
         if tags:
             tag_text = "\n".join([f"{k.capitalize()}: {v}" for k, v in tags.items() if v])
             QApplication.clipboard().setText(tag_text)
@@ -1509,15 +1787,54 @@ class MP3Player(QWidget):
     def play_index(self, idx):
         if idx < 0 or idx >= len(self.playlist_queue):
             return
+            
+        # Record the session of the song that is currently ending
+        self._record_current_session()
+
         entry = self.playlist_queue[idx]
         self.current_index = idx
         path = entry['path']
         self.now_playing_label.setText(f"Playing: {entry['title']}")
         self._marquee_text = f"Playing: {entry['title']}"
         self._marquee_offset = 0
-        self.player.setSource(QUrl.fromLocalFile(path))
+        self._play_counted = False # Reset for the new track
+        
+        # Start new session tracking
+        self._current_session_path = path
+        self._current_session_max_pos = 0
+        
+        abs_path = os.path.join(self.music_path, path)
+        self.player.setSource(QUrl.fromLocalFile(abs_path))
         self.player.play()
         self.update_playlist_ui()
+
+    def _record_current_session(self):
+        """Writes the current play session details to the database play_log."""
+        if not self._current_session_path:
+            return
+
+        duration_ms = self.player.duration()
+        if duration_ms <= 0:
+            return
+
+        # Calculate how much was played (using the furthest point reached)
+        played_secs = self._current_session_max_pos / 1000.0
+        total_secs = duration_ms / 1000.0
+        
+        # A song is 'fully played' if they reached 90% of the end
+        was_fully_played = (self._current_session_max_pos / duration_ms) >= 0.90
+        
+        # Log to detailed play_log
+        DatabaseManager.log_play_event(
+            self._current_session_path,
+            played_secs,
+            total_secs,
+            was_fully_played
+        )
+        
+        # Clean up session state
+        self._current_session_path = None
+        self._current_session_max_pos = 0
 
     def on_play_clicked(self):
         state = self.player.playbackState()
@@ -1555,12 +1872,26 @@ class MP3Player(QWidget):
 
     def on_position_changed(self, pos):
         # pos in ms
-        if not self._seeking and self.player.duration() > 0:
-            ratio = pos / self.player.duration()
+        duration = self.player.duration()
+        if not self._seeking and duration > 0:
+            ratio = pos / duration
             self.progress_slider.setValue(int(ratio * 1000))
+            
+            # Update furthest point reached for history metrics
+            if pos > self._current_session_max_pos:
+                self._current_session_max_pos = pos
+
+            # Play-count metric logic: Trigger at 30%
+            if not self._play_counted and ratio >= 0.30:
+                self._play_counted = True
+                path = self.player.source().toLocalFile()
+                if path:
+                    DatabaseManager.increment_play_count(path)
+                    print(f"Metric: Play count incremented for {Path(path).name}")
+
         # update time label
         cur = int(pos / 1000)
-        total = int(self.player.duration() / 1000) if self.player.duration() > 0 else 0
+        total = int(duration / 1000) if duration > 0 else 0
         self.current_time_label.setText(f"{cur//60:02d}:{cur%60:02d}")
         self.total_time_label.setText(f"{total//60:02d}:{total%60:02d}")
     
@@ -1648,6 +1979,9 @@ class MP3Player(QWidget):
         """
         Overrides the close event to stop playback and ensure any running background threads are stopped.
         """
+        # Record final session if still playing
+        self._record_current_session()
+        
         self.player.stop() # Stop any currently playing audio
         
         # Save tree expansion state and scroll position before closing
@@ -1685,11 +2019,14 @@ class MP3Player(QWidget):
         new_tag_data = {tag: widget.text() for tag, widget in self.tag_fields.items()}
 
         # --- Step 2: Save the tags to the file and database ---
-        if not MetadataManager.save_tags(self.current_mp3_path, new_tag_data.copy()): # Use copy as save_tags modifies it
-            QMessageBox.critical(self, "Error Saving Tags", f"Failed to save tags for {Path(self.current_mp3_path).name}.")
+        rel_path = self.current_mp3_path
+        abs_path = os.path.join(self.music_path, rel_path)
+        
+        if not MetadataManager.save_tags(abs_path, new_tag_data.copy(), rel_path=rel_path):
+            QMessageBox.critical(self, "Error Saving Tags", f"Failed to save tags for {Path(rel_path).name}.")
             return
         
-        QMessageBox.information(self, "Tags Saved", f"Tags for {Path(self.current_mp3_path).name} saved successfully.")
+        QMessageBox.information(self, "Tags Saved", f"Tags for {Path(rel_path).name} saved successfully.")
         self._mark_snapshot_dirty()
 
         # --- Step 3: Decide how to update the UI ---

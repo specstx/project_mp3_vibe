@@ -8,7 +8,7 @@ class DatabaseManager:
         cursor = conn.cursor()
         song_dict = song.to_dict()
         
-        columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating"]
+        columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating", "last_played", "is_present"]
         placeholders = ["?"] * len(columns)
         values = [song_dict[col] for col in columns]
 
@@ -39,7 +39,7 @@ class DatabaseManager:
             for song in songs:
                 song_dict = song.to_dict()
                 
-                columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating"]
+                columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating", "last_played", "is_present"]
                 placeholders = ["?"] * len(columns)
                 values = [song_dict.get(col) for col in columns]
 
@@ -58,6 +58,109 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    @staticmethod
+    def mark_offline(rel_paths: list[str]):
+        """Marks songs as offline instead of deleting them."""
+        if not rel_paths:
+            return
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        chunk_size = 900
+        
+        try:
+            for i in range(0, len(rel_paths), chunk_size):
+                chunk = rel_paths[i:i + chunk_size]
+                placeholders = ','.join('?' for _ in chunk)
+                query = f"UPDATE library SET is_present = 0 WHERE file_path IN ({placeholders})"
+                cursor.execute(query, tuple(chunk))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_present_songs():
+        """Retrieves all songs currently marked as present."""
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM library WHERE is_present = 1 ORDER BY genre, artist, album, file_path")
+        rows = cursor.fetchall()
+        conn.close()
+        return [Song.from_dict(dict(row)) for row in rows]
+
+    @staticmethod
+    def increment_play_count(filepath):
+        """Increments play count and updates last_played timestamp."""
+        import datetime
+        now = datetime.datetime.now().isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE library 
+                SET play_count = play_count + 1, last_played = ?
+                WHERE file_path = ?
+            """, (now, filepath))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def log_play_event(filepath, duration_played, total_duration, was_fully_played):
+        """Records a detailed play event to the play_log."""
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO play_log (file_path, duration_played, total_duration, was_fully_played)
+                VALUES (?, ?, ?, ?)
+            """, (filepath, duration_played, total_duration, 1 if was_fully_played else 0))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_statistics():
+        """Returns a dictionary of library statistics."""
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        stats = {}
+        try:
+            # Total tracks
+            cursor.execute("SELECT COUNT(*) FROM library")
+            stats['total_tracks'] = cursor.fetchone()[0]
+
+            # Total duration
+            cursor.execute("SELECT SUM(duration) FROM library")
+            stats['total_duration'] = cursor.fetchone()[0] or 0
+
+            # Top Genre
+            cursor.execute("SELECT genre, COUNT(*) as c FROM library GROUP BY genre ORDER BY c DESC LIMIT 1")
+            row = cursor.fetchone()
+            stats['top_genre'] = row[0] if row else "N/A"
+
+            # Top Artist
+            cursor.execute("SELECT artist, COUNT(*) as c FROM library GROUP BY artist ORDER BY c DESC LIMIT 1")
+            row = cursor.fetchone()
+            stats['top_artist'] = row[0] if row else "N/A"
+
+            # Metadata Health (missing Artist or Title or Album)
+            cursor.execute("""
+                SELECT COUNT(*) FROM library 
+                WHERE artist IS NULL OR artist = 'Unknown' 
+                   OR title IS NULL OR title = ''
+                   OR album IS NULL OR album = 'Unknown'
+            """)
+            stats['missing_metadata'] = cursor.fetchone()[0]
+
+            # Top Rated (4.0+)
+            cursor.execute("SELECT COUNT(*) FROM library WHERE rating >= 4.0")
+            stats['top_rated_count'] = cursor.fetchone()[0]
+
+        finally:
+            conn.close()
+        return stats
 
     @staticmethod
     def get_song_by_path(filepath):
