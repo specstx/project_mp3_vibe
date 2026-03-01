@@ -109,16 +109,21 @@ class ScannerThread(QThread):
                     except Exception as e:
                         print(f"EasyID3 read failed for {path_str}: {e}")
 
-                    # 2. Try standard MP3 for duration
+                    # 2. Try standard MP3 for duration and rating
+                    rating = 0.0
                     try:
                         audio_file = MP3(path_str)
                         duration = audio_file.info.length if audio_file.info else 0.0
+                        
+                        # Extraction rating from the same object
+                        popms = audio_file.tags.getall("POPM") if audio_file.tags else []
+                        if popms:
+                            rating_val = popms[0].rating
+                            rating = round(rating_val / 255 * 5 * 2) / 2
                     except Exception as e:
-                        print(f"MP3 duration read failed for {path_str}: {e}")
+                        print(f"MP3 read failed for {path_str}: {e}")
 
                     # 3. Post-processing & Sanitization
-                    rating = MetadataManager.load_rating(path_str) # Extraction rating from file
-                    
                     if tracknumber:
                         was_changed, clean_tracknumber = sanitize_track_number(tracknumber)
                         if was_changed:
@@ -157,8 +162,10 @@ class ScannerThread(QThread):
                         song_batch = []
 
             # Reduce emission frequency to every 5 seconds or 1000 files
-            if hasattr(self, "progress") and (file_count % 1000 == 0):
-                self.progress.emit(f"Scanning: {dirpath}")
+            if file_count % 1000 == 0:
+                print(f"Scanner: Processed {file_count} tracks...")
+                if hasattr(self, "progress"):
+                    self.progress.emit(f"Scanning: {dirpath}")
         
         if not self.is_running:
             print("Scan aborted by user. Committing partial results...")

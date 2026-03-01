@@ -806,8 +806,47 @@ class MP3Player(QMainWindow):
     
     def undo_tag_change(self): pass
     def redo_tag_change(self): pass
+    
+    def _get_selected_rel_path(self):
+        """Helper to get the relative path of the selected track in Tree or Playlist."""
+        # Check Library Tree first
+        item = self.tree.currentItem()
+        if item:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and isinstance(data, dict) and data.get('type') == 'track':
+                return data.get('path')
+        
+        # Check Playlist Widget
+        p_item = self.playlist_widget.currentItem()
+        if p_item:
+            path = p_item.data(0, Qt.ItemDataRole.UserRole)
+            if path:
+                return path
+        
+        # Fallback to current playing path if nothing selected
+        return self.current_mp3_path
+
     def show_extended_tags(self): pass
-    def show_file_properties(self): pass
+
+    def show_file_properties(self):
+        """Displays technical properties for the selected track."""
+        rel_path = self._get_selected_rel_path()
+        if not rel_path:
+            QMessageBox.information(self, "Properties", "Please select a track first.")
+            return
+
+        abs_path = os.path.join(self.music_path, rel_path)
+        if not os.path.exists(abs_path):
+            QMessageBox.critical(self, "Error", f"File not found: {rel_path}")
+            return
+
+        props = MetadataManager.get_technical_properties(abs_path)
+        
+        msg = "<b>Technical Properties</b><br><br>"
+        for key, val in props.items():
+            msg += f"<b>{key}:</b> {val}<br>"
+        
+        QMessageBox.information(self, "Track Properties", msg)
     
     def tool_case_conversion(self): pass
     def tool_char_replacement(self): pass
