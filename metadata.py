@@ -29,19 +29,20 @@ PROJECT_DIR = Path(__file__).resolve().parent
 class ScannerThread(QThread):
     finished = pyqtSignal(dict, list, list, dict) # dict: library tree, list: tags to fix, list: years to fix, dict: snapshot
     progress = pyqtSignal(str)
-    artist_changed = pyqtSignal()
 
-    def __init__(self, root_path):
+    def __init__(self, root_path, db_paths=None):
         super().__init__()
         self.root_path = root_path
+        self.db_paths = db_paths or set()
         self.is_running = True
 
     def stop(self):
         self.is_running = False
 
     def run(self):
-        # --- Step 1: Get initial state ---
-        db_paths = set(DatabaseManager.get_all_filepaths())
+        print(f"--- Scan Started: {self.root_path} ---")
+        # SOVEREIGN: We no longer fetch all paths upfront to avoid hanging on large DBs.
+        # We will mark offline at the end using a set of found paths.
         found_rel_paths = set()
         
         tree = {} # This is for the old tree logic, can be removed later
@@ -116,6 +117,8 @@ class ScannerThread(QThread):
                         print(f"MP3 duration read failed for {path_str}: {e}")
 
                     # 3. Post-processing & Sanitization
+                    rating = MetadataManager.load_rating(path_str) # Extraction rating from file
+                    
                     if tracknumber:
                         was_changed, clean_tracknumber = sanitize_track_number(tracknumber)
                         if was_changed:
@@ -142,6 +145,7 @@ class ScannerThread(QThread):
                         genre=genre,
                         year=clean_year,
                         duration=duration,
+                        rating=rating,
                         is_present=1, # It's here
                         ext_1=clean_tracknumber
                     )
@@ -151,11 +155,9 @@ class ScannerThread(QThread):
                     if len(song_batch) >= 500:
                         DatabaseManager.add_songs_batch(song_batch)
                         song_batch = []
-                        if artist and artist != self.last_artist:
-                            self.artist_changed.emit()
-                            self.last_artist = artist
 
-            if hasattr(self, "progress") and int(time.time()) % 2 == 0:
+            # Reduce emission frequency to every 5 seconds or 1000 files
+            if hasattr(self, "progress") and (file_count % 1000 == 0):
                 self.progress.emit(f"Scanning: {dirpath}")
         
         if not self.is_running:
@@ -168,10 +170,9 @@ class ScannerThread(QThread):
         if song_batch:
             DatabaseManager.add_songs_batch(song_batch)
         
-        stale_paths = db_paths - found_rel_paths
-        if stale_paths:
-            print(f"Marking {len(stale_paths)} tracks as offline...")
-            DatabaseManager.mark_offline(list(stale_paths))
+        # SOVEREIGN: Perform an efficient final sync of online/offline status
+        print("Finalizing metadata sync...")
+        DatabaseManager.mark_all_offline_except(found_rel_paths)
 
         # --- Step 4: Finalize and emit finished signal ---
         try:
@@ -258,6 +259,16 @@ class MetadataManager:
         except Exception as e:
             print(f"Failed to load extended tags: {e}")
         return all_tags
+
+    @staticmethod
+    def get_missing_tags(song: Song):
+        """Returns a list of missing critical tags for a song."""
+        missing = []
+        if not song.artist or song.artist == 'Unknown': missing.append("Artist")
+        if not song.title or song.title == '': missing.append("Title")
+        if not song.album or song.album == 'Unknown': missing.append("Album")
+        if not song.genre or song.genre == 'Unknown': missing.append("Genre")
+        return missing
 
     @staticmethod
     def get_technical_properties(path):

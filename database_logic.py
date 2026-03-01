@@ -3,8 +3,16 @@ from models import DB_PATH, Song
 
 class DatabaseManager:
     @staticmethod
+    def _get_connection():
+        """Helper to get a connection with WAL mode enabled and a longer timeout."""
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        # WAL mode allows concurrent reads and writes
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    @staticmethod
     def add_song(song: Song):
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         song_dict = song.to_dict()
         
@@ -32,7 +40,7 @@ class DatabaseManager:
         if not songs:
             return
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         
         try:
@@ -64,7 +72,7 @@ class DatabaseManager:
         if not rel_paths:
             return
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         chunk_size = 900
         
@@ -81,7 +89,7 @@ class DatabaseManager:
     @staticmethod
     def get_present_songs():
         """Retrieves all songs currently marked as present."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM library WHERE is_present = 1 ORDER BY genre, artist, album, file_path")
@@ -94,7 +102,7 @@ class DatabaseManager:
         """Increments play count and updates last_played timestamp."""
         import datetime
         now = datetime.datetime.now().isoformat()
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -109,7 +117,7 @@ class DatabaseManager:
     @staticmethod
     def log_play_event(filepath, duration_played, total_duration, was_fully_played):
         """Records a detailed play event to the play_log."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -123,7 +131,7 @@ class DatabaseManager:
     @staticmethod
     def get_statistics():
         """Returns a dictionary of library statistics."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         stats = {}
         try:
@@ -131,31 +139,38 @@ class DatabaseManager:
             cursor.execute("SELECT COUNT(*) FROM library")
             stats['total_tracks'] = cursor.fetchone()[0]
 
-            # Total duration
-            cursor.execute("SELECT SUM(duration) FROM library")
+            # Online vs Offline breakdown
+            cursor.execute("SELECT COUNT(*) FROM library WHERE is_present = 1")
+            stats['online_tracks'] = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM library WHERE is_present = 0")
+            stats['offline_tracks'] = cursor.fetchone()[0]
+
+            # Total duration (of online tracks)
+            cursor.execute("SELECT SUM(duration) FROM library WHERE is_present = 1")
             stats['total_duration'] = cursor.fetchone()[0] or 0
 
-            # Top Genre
-            cursor.execute("SELECT genre, COUNT(*) as c FROM library GROUP BY genre ORDER BY c DESC LIMIT 1")
+            # Top Genre (online)
+            cursor.execute("SELECT genre, COUNT(*) as c FROM library WHERE is_present = 1 GROUP BY genre ORDER BY c DESC LIMIT 1")
             row = cursor.fetchone()
             stats['top_genre'] = row[0] if row else "N/A"
 
-            # Top Artist
-            cursor.execute("SELECT artist, COUNT(*) as c FROM library GROUP BY artist ORDER BY c DESC LIMIT 1")
+            # Top Artist (online)
+            cursor.execute("SELECT artist, COUNT(*) as c FROM library WHERE is_present = 1 GROUP BY artist ORDER BY c DESC LIMIT 1")
             row = cursor.fetchone()
             stats['top_artist'] = row[0] if row else "N/A"
 
             # Metadata Health (missing Artist or Title or Album)
             cursor.execute("""
                 SELECT COUNT(*) FROM library 
-                WHERE artist IS NULL OR artist = 'Unknown' 
+                WHERE is_present = 1 AND (artist IS NULL OR artist = 'Unknown' 
                    OR title IS NULL OR title = ''
-                   OR album IS NULL OR album = 'Unknown'
+                   OR album IS NULL OR album = 'Unknown')
             """)
             stats['missing_metadata'] = cursor.fetchone()[0]
 
             # Top Rated (4.0+)
-            cursor.execute("SELECT COUNT(*) FROM library WHERE rating >= 4.0")
+            cursor.execute("SELECT COUNT(*) FROM library WHERE is_present = 1 AND rating >= 4.0")
             stats['top_rated_count'] = cursor.fetchone()[0]
 
         finally:
@@ -163,8 +178,47 @@ class DatabaseManager:
         return stats
 
     @staticmethod
+    def delete_offline_songs():
+        """Permanently removes all records marked as offline."""
+        conn = DatabaseManager._get_connection()
+        cursor = conn.cursor()
+        try:
+            # Note: Because of our FOREIGN KEY setup, we should decide if we want to 
+            # delete the play history too. Usually, if the song record is gone, 
+            # the history should be cleaned to avoid orphan records.
+            cursor.execute("DELETE FROM play_log WHERE file_path IN (SELECT file_path FROM library WHERE is_present = 0)")
+            cursor.execute("DELETE FROM library WHERE is_present = 0")
+            conn.commit()
+            return cursor.rowcount
+        finally:
+            conn.close()
+
+    @staticmethod
+    def mark_all_offline_except(found_rel_paths: set[str]):
+        """Sets is_present=0 for all records NOT in the provided set of relative paths."""
+        conn = DatabaseManager._get_connection()
+        cursor = conn.cursor()
+        try:
+            # 1. Mark everyone offline initially
+            cursor.execute("UPDATE library SET is_present = 0")
+            
+            # 2. Mark found tracks online in chunks
+            paths_list = list(found_rel_paths)
+            chunk_size = 900
+            for i in range(0, len(paths_list), chunk_size):
+                chunk = paths_list[i:i + chunk_size]
+                placeholders = ','.join('?' for _ in chunk)
+                query = f"UPDATE library SET is_present = 1 WHERE file_path IN ({placeholders})"
+                cursor.execute(query, tuple(chunk))
+            
+            conn.commit()
+            print(f"Sovereign: Metadata sync complete. {len(paths_list)} tracks online.")
+        finally:
+            conn.close()
+
+    @staticmethod
     def get_song_by_path(filepath):
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM library WHERE file_path = ?", (filepath,))
@@ -176,7 +230,7 @@ class DatabaseManager:
 
     @staticmethod
     def get_all_songs():
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM library ORDER BY file_path")
@@ -187,7 +241,7 @@ class DatabaseManager:
     @staticmethod
     def get_all_songs_sorted():
         """Retrieves all songs sorted by genre, artist, and album for efficient hierarchy building."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         # Use the newly created indices for a fast sorted query
@@ -199,7 +253,7 @@ class DatabaseManager:
     @staticmethod
     def get_all_filepaths():
         """Retrieves a list of all file paths currently in the database."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT file_path FROM library")
         rows = cursor.fetchall()
@@ -212,7 +266,7 @@ class DatabaseManager:
         if not paths:
             return
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = DatabaseManager._get_connection()
         cursor = conn.cursor()
         chunk_size = 900 # Staying well under the 999 limit
         

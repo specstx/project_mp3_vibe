@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,
     QMenu, QMainWindow, QMenuBar)
 import signal
+import datetime
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor, QAction
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -163,36 +164,54 @@ class CustomTreeWidgetItem(QTreeWidgetItem):
 class TagFixerThread(QThread):
     finished = pyqtSignal(int, int) # successful_fixes, failed_fixes
 
-    def __init__(self, tags_to_fix):
+    def __init__(self, tags_to_fix, music_path):
         super().__init__()
         self.tags_to_fix = tags_to_fix
+        self.music_path = music_path
 
     def run(self):
         successful = 0
         failed = 0
-        for path, new_value in self.tags_to_fix:
-            if MetadataManager.save_tags(path, {'tracknumber': new_value}):
+        log_entries = []
+        for rel_path, new_value in self.tags_to_fix:
+            abs_path = os.path.join(self.music_path, rel_path)
+            if MetadataManager.save_tags(abs_path, {'tracknumber': new_value}, rel_path=rel_path):
                 successful += 1
             else:
                 failed += 1
+                log_entries.append(f"{datetime.datetime.now()} - FAILED Track Fix: {rel_path}")
+        
+        if log_entries:
+            with open("audit_log.txt", "a") as f:
+                f.write("\n".join(log_entries) + "\n")
+                
         self.finished.emit(successful, failed)
 
 
 class YearFixerThread(QThread):
     finished = pyqtSignal(int, int) # successful_fixes, failed_fixes
 
-    def __init__(self, years_to_fix):
+    def __init__(self, years_to_fix, music_path):
         super().__init__()
         self.years_to_fix = years_to_fix
+        self.music_path = music_path
 
     def run(self):
         successful = 0
         failed = 0
-        for path, new_value in self.years_to_fix:
-            if MetadataManager.save_tags(path, {'date': new_value}):
+        log_entries = []
+        for rel_path, new_value in self.years_to_fix:
+            abs_path = os.path.join(self.music_path, rel_path)
+            if MetadataManager.save_tags(abs_path, {'date': new_value}, rel_path=rel_path):
                 successful += 1
             else:
                 failed += 1
+                log_entries.append(f"{datetime.datetime.now()} - FAILED Year Fix: {rel_path}")
+
+        if log_entries:
+            with open("audit_log.txt", "a") as f:
+                f.write("\n".join(log_entries) + "\n")
+
         self.finished.emit(successful, failed)
 
 
@@ -365,6 +384,8 @@ class MP3Player(QMainWindow):
         self._current_session_path = None
         self._current_session_start_pos = 0 
         self._current_session_max_pos = 0 # Track furthest point reached in song
+        self._current_session_accumulated_ms = 0 # Track total time resided (seek-proof)
+        self._current_session_last_pos = 0 # Reference for delta calculation
 
         # Color constants
         self._COLOR_OFF_WHITE = QColor("#E0E0E0")
@@ -559,6 +580,19 @@ class MP3Player(QMainWindow):
         # Layout arrangement
         self.build_layout()
 
+        # Restore column widths
+        lib_widths = self.cfg.get('library_column_widths')
+        if lib_widths:
+            for i, width in enumerate(lib_widths):
+                if i < self.tree.columnCount():
+                    self.tree.setColumnWidth(i, width)
+        
+        play_widths = self.cfg.get('playlist_column_widths')
+        if play_widths:
+            for i, width in enumerate(play_widths):
+                if i < self.playlist_widget.columnCount():
+                    self.playlist_widget.setColumnWidth(i, width)
+
         # Stagger the initial load and scan to allow the UI to show up first
         QTimer.singleShot(100, self.initial_load_and_scan)
 
@@ -579,6 +613,10 @@ class MP3Player(QMainWindow):
         db_stats_action = QAction("Database Statistics", self)
         db_stats_action.triggered.connect(self.show_db_stats)
         file_menu.addAction(db_stats_action)
+        
+        prune_action = QAction("Prune Offline Tracks", self)
+        prune_action.triggered.connect(self.prune_offline_tracks)
+        file_menu.addAction(prune_action)
         
         clear_view_action = QAction("Clear View", self)
         clear_view_action.triggered.connect(self.clear_active_view)
@@ -717,21 +755,40 @@ class MP3Player(QMainWindow):
         hours = int((td % 86400) // 3600)
         minutes = int((td % 3600) // 60)
         
-        # Calculate file size estimate (very rough based on 5MB average or we can do a real sum if needed)
-        # For now, let's just stick to the counts.
-        
         msg = (
             f"<b>Library Overview</b><br><br>"
-            f"Total Tracks: {stats['total_tracks']:,}<br>"
-            f"Total Playtime: {days}d {hours}h {minutes}m<br>"
+            f"Online Tracks: {stats['online_tracks']:,}<br>"
+            f"Offline Tracks: {stats['offline_tracks']:,}<br>"
+            f"Total Playtime (Online): {days}d {hours}h {minutes}m<br>"
             f"Top Genre: {stats['top_genre']}<br>"
             f"Top Artist: {stats['top_artist']}<br><br>"
-            f"<b>Health & Ratings</b><br>"
+            f"<b>Health & Ratings (Online Only)</b><br>"
             f"Missing Metadata: {stats['missing_metadata']}<br>"
             f"Highly Rated (4.0+): {stats['top_rated_count']}"
         )
         
         QMessageBox.information(self, "Database Statistics", msg)
+
+    def prune_offline_tracks(self):
+        """Permanently deletes songs that are marked as offline."""
+        stats = DatabaseManager.get_statistics()
+        offline_count = stats['offline_tracks']
+        
+        if offline_count == 0:
+            QMessageBox.information(self, "Prune Library", "No offline tracks found to prune.")
+            return
+
+        reply = QMessageBox.warning(
+            self, "Prune Offline Tracks", 
+            f"Found {offline_count:,} tracks that are not on the current drive.<br><br>"
+            "Are you sure you want to <b>permanently delete</b> these records and their history from the database?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            count = DatabaseManager.delete_offline_songs()
+            QMessageBox.information(self, "Prune Complete", f"Successfully removed {count:,} stale records.")
+            self.populate_tree() # Refresh UI
 
     def clear_active_view(self):
         """Clears the active playlist."""
@@ -755,7 +812,40 @@ class MP3Player(QMainWindow):
     def tool_case_conversion(self): pass
     def tool_char_replacement(self): pass
     def tool_autonumbering(self): pass
-    def tool_integrity_check(self): pass
+    def tool_integrity_check(self):
+        """Audits the library for missing metadata and logs details."""
+        songs = DatabaseManager.get_present_songs()
+        if not songs:
+            QMessageBox.information(self, "Integrity Check", "No online songs found to audit.")
+            return
+
+        self.now_playing_label.setText("Auditing Library Metadata...")
+        QApplication.processEvents()
+
+        unhealthy_count = 0
+        log_entries = [f"\n--- METADATA AUDIT: {datetime.datetime.now()} ---"]
+        
+        for song in songs:
+            missing = MetadataManager.get_missing_tags(song)
+            if missing:
+                unhealthy_count += 1
+                tags_str = ", ".join(missing)
+                log_entries.append(f"MISSING [{tags_str}]: {song.file_path}")
+
+        if unhealthy_count > 0:
+            with open("audit_log.txt", "a") as f:
+                f.write("\n".join(log_entries) + "\n")
+            
+            msg = (
+                f"<b>Integrity Check Complete</b><br><br>"
+                f"Found {unhealthy_count:,} tracks with missing metadata.<br><br>"
+                f"Details have been logged to <b>audit_log.txt</b>."
+            )
+            QMessageBox.warning(self, "Integrity Check", msg)
+        else:
+            QMessageBox.information(self, "Integrity Check", "Metadata Audit passed! No missing tags found.")
+        
+        self.now_playing_label.setText("Ready")
     
     def tagger_musicbrainz_lookup(self): pass
     def tagger_cluster_files(self): pass
@@ -827,12 +917,16 @@ class MP3Player(QMainWindow):
 
         if saved_snapshot and saved_snapshot == current_snapshot:
             print("Library unchanged, skipping background scan.")
+            # Ensure scanner_thread is ready for manual rescans
+            self.scanner_thread = ScannerThread(self.music_path)
+            self.scanner_thread.finished.connect(self.on_scan_finished)
+            self.scanner_thread.progress.connect(self.on_scan_progress)
+            
             # Step 1: Populate the tree immediately with current DB data
             print("Performing initial library load from database...")
             # Restore state if available (fallback to old expanded_paths if tree_state is missing)
             tree_state = self.cfg.get('tree_state', self.cfg.get('expanded_paths', []))
             self.populate_tree(tree_state)
-            QApplication.processEvents() # Ensure UI is responsive
             self.rescan_btn.setEnabled(True)
             self.now_playing_label.setText("Ready")
             return
@@ -843,11 +937,11 @@ class MP3Player(QMainWindow):
             # Restore state if available
             tree_state = self.cfg.get('tree_state', self.cfg.get('expanded_paths', []))
             self.populate_tree(tree_state)
-            QApplication.processEvents() # Ensure UI is responsive after initial populate
             
             # Step 2: Start the automatic background scan
             print("Starting automatic background scan to update and prune library...")
-            self.start_scan(background=True)
+            # Use QTimer to ensure this runs AFTER the initial UI has had a chance to breathe
+            QTimer.singleShot(500, lambda: self.start_scan(background=True))
 
     def build_layout(self):
         # Main layout container
@@ -972,11 +1066,21 @@ class MP3Player(QMainWindow):
         if not os.path.isdir(self.music_path):
             QMessageBox.warning(self, "Music folder not found", f"Folder not found: {self.music_path}")
             return
+        
+        # Prevent multiple scanner threads
+        if self.scanner_thread and self.scanner_thread.isRunning():
+            return
+
         self.rescan_btn.setEnabled(False)
+        self.now_playing_label.setText("Preparing Scan...")
+        print("UI: Preparing Scan...")
+        QApplication.processEvents()
+
         # start thread
         self.scanner_thread = ScannerThread(self.music_path)
         self.scanner_thread.finished.connect(self.on_scan_finished)
         self.scanner_thread.progress.connect(self.on_scan_progress)
+        
         if background:
             self.scanner_thread.start()
         else:
@@ -1021,18 +1125,18 @@ class MP3Player(QMainWindow):
     def _apply_tag_fixes(self, tags_to_fix):
         """Starts a background thread to apply track number fixes."""
         self.now_playing_label.setText(f"Fixing {len(tags_to_fix)} tags...")
-        self.fixer_thread = TagFixerThread(tags_to_fix)
+        self.fixer_thread = TagFixerThread(tags_to_fix, self.music_path)
         self.fixer_thread.finished.connect(self._on_tag_fix_finished)
         self.fixer_thread.start()
 
     def _on_tag_fix_finished(self, successful, failed):
         """Handles the completion of the TagFixerThread."""
         self.now_playing_label.setText("Tag fixing complete.")
-        QMessageBox.information(
-            self, 
-            "Tag Fix Complete",
-            f"Successfully fixed {successful} tags.\nFailed to fix {failed} tags."
-        )
+        msg = f"Successfully fixed {successful} tags.\nFailed to fix {failed} tags."
+        if failed > 0:
+            msg += "\n\nSee audit_log.txt for a list of failed files."
+        
+        QMessageBox.information(self, "Tag Fix Complete", msg)
         # The database is now in sync with the file tags, but the view is not.
         # A full populate is needed to show the corrected numbers.
         self.populate_tree()
@@ -1042,18 +1146,18 @@ class MP3Player(QMainWindow):
     def _apply_year_fixes(self, years_to_fix):
         """Starts a background thread to apply year fixes."""
         self.now_playing_label.setText(f"Fixing {len(years_to_fix)} year tags...")
-        self.year_fixer_thread = YearFixerThread(years_to_fix)
+        self.year_fixer_thread = YearFixerThread(years_to_fix, self.music_path)
         self.year_fixer_thread.finished.connect(self._on_year_fix_finished)
         self.year_fixer_thread.start()
 
     def _on_year_fix_finished(self, successful, failed):
         """Handles the completion of the YearFixerThread."""
         self.now_playing_label.setText("Year tag fixing complete.")
-        QMessageBox.information(
-            self,
-            "Year Fix Complete",
-            f"Successfully fixed {successful} year tags.\nFailed to fix {failed} year tags."
-        )
+        msg = f"Successfully fixed {successful} year tags.\nFailed to fix {failed} year tags."
+        if failed > 0:
+            msg += "\n\nSee audit_log.txt for a list of failed files."
+
+        QMessageBox.information(self, "Year Fix Complete", msg)
         # The database is now in sync with the file tags, but the view is not.
         # A full populate is needed to show the corrected numbers.
         self.populate_tree()
@@ -1802,6 +1906,8 @@ class MP3Player(QMainWindow):
         # Start new session tracking
         self._current_session_path = path
         self._current_session_max_pos = 0
+        self._current_session_accumulated_ms = 0
+        self._current_session_last_pos = 0
         
         abs_path = os.path.join(self.music_path, path)
         self.player.setSource(QUrl.fromLocalFile(abs_path))
@@ -1817,12 +1923,17 @@ class MP3Player(QMainWindow):
         if duration_ms <= 0:
             return
 
-        # Calculate how much was played (using the furthest point reached)
-        played_secs = self._current_session_max_pos / 1000.0
+        # SOVEREIGN: Use honest 'time resided' for metrics
+        played_secs = self._current_session_accumulated_ms / 1000.0
         total_secs = duration_ms / 1000.0
         
-        # A song is 'fully played' if they reached 90% of the end
-        was_fully_played = (self._current_session_max_pos / duration_ms) >= 0.90
+        # Dual-Check for 'Full Play':
+        # 1. Did they reach the 90% mark (max_pos)?
+        # 2. Did they actually listen to at least 50% of the song (seek-proof)?
+        was_fully_played = (
+            (self._current_session_max_pos / duration_ms) >= 0.90 and
+            (self._current_session_accumulated_ms / duration_ms) >= 0.50
+        )
         
         # Log to detailed play_log
         DatabaseManager.log_play_event(
@@ -1835,6 +1946,8 @@ class MP3Player(QMainWindow):
         # Clean up session state
         self._current_session_path = None
         self._current_session_max_pos = 0
+        self._current_session_accumulated_ms = 0
+        self._current_session_last_pos = 0
 
     def on_play_clicked(self):
         state = self.player.playbackState()
@@ -1877,6 +1990,12 @@ class MP3Player(QMainWindow):
             ratio = pos / duration
             self.progress_slider.setValue(int(ratio * 1000))
             
+            # SOVEREIGN: Seek-Proof Accumulation
+            delta = pos - self._current_session_last_pos
+            if 0 < delta < 2000: # Only count normal playback, ignore seeks/jumps
+                self._current_session_accumulated_ms += delta
+            self._current_session_last_pos = pos
+
             # Update furthest point reached for history metrics
             if pos > self._current_session_max_pos:
                 self._current_session_max_pos = pos
@@ -1993,6 +2112,11 @@ class MP3Player(QMainWindow):
         # Save tree expansion state and scroll position before closing
         tree_state = self.save_tree_state()
         self.cfg['tree_state'] = tree_state
+        
+        # Save column widths
+        self.cfg['library_column_widths'] = [self.tree.columnWidth(i) for i in range(self.tree.columnCount())]
+        self.cfg['playlist_column_widths'] = [self.playlist_widget.columnWidth(i) for i in range(self.playlist_widget.columnCount())]
+        
         save_config(self.cfg)
 
         # Stop background threads
