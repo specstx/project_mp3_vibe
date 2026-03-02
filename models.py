@@ -10,7 +10,7 @@ DB_PATH = PROJECT_DIR / "music_library.db"
 class Song:
     """Represents a single music track with all its metadata."""
 
-    def __init__(self, file_path, artist=None, title=None, album=None, genre=None, year=None, comment=None, duration=0.0, play_count=0, rating=0.0, last_played=None, is_present=1, **kwargs):
+    def __init__(self, file_path, artist=None, title=None, album=None, genre=None, year=None, comment=None, duration=0.0, play_count=0, rating=0.0, last_played=None, is_present=1, is_mirrored=0, **kwargs):
         self.file_path = Path(file_path) # Now represents a RELATIVE path
         self.artist = artist
         self.title = title
@@ -23,6 +23,7 @@ class Song:
         self.rating = rating
         self.last_played = last_played
         self.is_present = is_present
+        self.is_mirrored = is_mirrored
         
         # Handle extended fields (ext_1 to ext_20)
         for i in range(1, 21):
@@ -42,7 +43,8 @@ class Song:
             "play_count": self.play_count,
             "rating": self.rating,
             "last_played": self.last_played,
-            "is_present": self.is_present
+            "is_present": self.is_present,
+            "is_mirrored": self.is_mirrored
         }
         for i in range(1, 21):
             data[f"ext_{i}"] = getattr(self, f"ext_{i}")
@@ -77,5 +79,6 @@ class Song:
             rating=data.get("rating", 0.0),
             last_played=data.get("last_played"),
             is_present=data.get("is_present", 1),
+            is_mirrored=data.get("is_mirrored", 0),
             **{f"ext_{i}": data.get(f"ext_{i}") for i in range(1, 21)}
         )

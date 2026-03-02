@@ -606,6 +606,14 @@ class MP3Player(QMainWindow):
         scan_sideshow_action.triggered.connect(self.scan_sideshow)
         file_menu.addAction(scan_sideshow_action)
         
+        ingest_action = QAction("Ingest from Parking", self)
+        ingest_action.triggered.connect(self.ingest_from_parking)
+        file_menu.addAction(ingest_action)
+        
+        open_report_action = QAction("Open Ingestion Report", self)
+        open_report_action.triggered.connect(self.file_open_ingestion_report)
+        file_menu.addAction(open_report_action)
+        
         add_folder_action = QAction("Add Folder to Collection", self)
         add_folder_action.triggered.connect(self.add_folder_to_collection)
         file_menu.addAction(add_folder_action)
@@ -668,6 +676,12 @@ class MP3Player(QMainWindow):
         integrity_action = QAction("Integrity Check", self)
         integrity_action.triggered.connect(self.tool_integrity_check)
         tools_menu.addAction(integrity_action)
+        
+        tools_menu.addSeparator()
+        
+        open_audit_log_action = QAction("Open Audit Log", self)
+        open_audit_log_action.triggered.connect(self.tool_open_audit_log)
+        tools_menu.addAction(open_audit_log_action)
 
         # 4. Tagger (Automated Logic)
         tagger_menu = menubar.addMenu("Tagger")
@@ -740,6 +754,48 @@ class MP3Player(QMainWindow):
                 QMessageBox.information(self, "Audit Complete", "Mirror sync/audit finished.")
             except Exception as e:
                 QMessageBox.critical(self, "Audit Error", f"Error: {e}")
+            finally:
+                self.now_playing_label.setText("Ready")
+
+    def ingest_from_parking(self):
+        """Invoke the Sovereign Ingestion Engine (Parking -> Master)."""
+        from sovereign_sync import SovereignIngest, SovereignSync
+        
+        reply = QMessageBox.question(
+            self, "Sovereign Ingestion", 
+            "Start Ingestion from Parking to SideShow (Master)?<br><br>"
+            "Processed files will be moved to <b>processed_trashcan</b>.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.now_playing_label.setText("Ingesting from Parking...")
+            QApplication.processEvents()
+            
+            try:
+                # 1. Run Ingestion
+                ingest_engine = SovereignIngest()
+                ingest_engine.run()
+                
+                # 2. Ask if we should mirror the changes immediately
+                mirror_reply = QMessageBox.question(
+                    self, "Ingestion Complete",
+                    "Ingestion finished. Check <b>ingestion_report.txt</b> for details.<br><br>"
+                    "Would you like to <b>Mirror</b> these changes to the External drive now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if mirror_reply == QMessageBox.StandardButton.Yes:
+                    self.now_playing_label.setText("Mirroring to External...")
+                    sync_engine = SovereignSync()
+                    sync_engine.run_mirror()
+                    QMessageBox.information(self, "Sync Complete", "Mirroring finished.")
+                
+                # 3. Always trigger a rescan to show new files in UI
+                self.start_scan()
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Ingestion Error", f"An error occurred: {e}")
             finally:
                 self.now_playing_label.setText("Ready")
 
@@ -885,7 +941,25 @@ class MP3Player(QMainWindow):
             QMessageBox.information(self, "Integrity Check", "Metadata Audit passed! No missing tags found.")
         
         self.now_playing_label.setText("Ready")
-    
+
+    def tool_open_audit_log(self):
+        """Opens the audit_log.txt file in the system default editor."""
+        log_path = os.path.join(PROJECT_DIR, "audit_log.txt")
+        if os.path.exists(log_path):
+            subprocess.run(["xdg-open", log_path])
+        else:
+            QMessageBox.information(self, "Audit Log", "No audit log found.")
+
+    def file_open_ingestion_report(self):
+        """Opens the ingestion_report.txt file in the system default editor."""
+        # Find the parking folder from SovereignSync defaults
+        from sovereign_sync import DEFAULT_SOURCE
+        report_path = os.path.join(DEFAULT_SOURCE, "ingestion_report.txt")
+        if os.path.exists(report_path):
+            subprocess.run(["xdg-open", report_path])
+        else:
+            QMessageBox.information(self, "Ingestion Report", "No ingestion report found.")
+
     def tagger_musicbrainz_lookup(self): pass
     def tagger_cluster_files(self): pass
     def tagger_scan_fingerprints(self): pass
@@ -915,6 +989,12 @@ class MP3Player(QMainWindow):
             try:
                 # Initialize engine with defaults
                 engine = SovereignSync()
+                
+                # Pre-check mirror drive existence
+                if not engine.mirror.exists():
+                    QMessageBox.warning(self, "Mirror Drive Missing", f"The Mirror drive was not found at:<br><br><b>{engine.mirror}</b><br><br>Please plug it in and try again.")
+                    return
+
                 engine.run()
                 QMessageBox.information(self, "Sync Complete", "Sovereign Sync finished successfully.")
             except Exception as e:

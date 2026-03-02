@@ -16,7 +16,7 @@ class DatabaseManager:
         cursor = conn.cursor()
         song_dict = song.to_dict()
         
-        columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating", "last_played", "is_present"]
+        columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating", "last_played", "is_present", "is_mirrored"]
         placeholders = ["?"] * len(columns)
         values = [song_dict[col] for col in columns]
 
@@ -47,7 +47,7 @@ class DatabaseManager:
             for song in songs:
                 song_dict = song.to_dict()
                 
-                columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating", "last_played", "is_present"]
+                columns = ["file_path", "artist", "title", "album", "genre", "year", "comment", "duration", "play_count", "rating", "last_played", "is_present", "is_mirrored"]
                 placeholders = ["?"] * len(columns)
                 values = [song_dict.get(col) for col in columns]
 
@@ -65,6 +65,53 @@ class DatabaseManager:
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def mark_as_mirrored(rel_paths: list[str]):
+        """Sets is_mirrored=1 for the provided list of relative paths."""
+        if not rel_paths:
+            return
+        conn = DatabaseManager._get_connection()
+        cursor = conn.cursor()
+        chunk_size = 900
+        try:
+            for i in range(0, len(rel_paths), chunk_size):
+                chunk = rel_paths[i:i + chunk_size]
+                placeholders = ','.join('?' for _ in chunk)
+                query = f"UPDATE library SET is_mirrored = 1 WHERE file_path IN ({placeholders})"
+                cursor.execute(query, tuple(chunk))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def mark_as_unmirrored(rel_paths: list[str]):
+        """Sets is_mirrored=0 for the provided list of relative paths."""
+        if not rel_paths:
+            return
+        conn = DatabaseManager._get_connection()
+        cursor = conn.cursor()
+        chunk_size = 900
+        try:
+            for i in range(0, len(rel_paths), chunk_size):
+                chunk = rel_paths[i:i + chunk_size]
+                placeholders = ','.join('?' for _ in chunk)
+                query = f"UPDATE library SET is_mirrored = 0 WHERE file_path IN ({placeholders})"
+                cursor.execute(query, tuple(chunk))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def get_unmirrored_songs():
+        """Retrieves all songs that are present but not yet mirrored."""
+        conn = DatabaseManager._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM library WHERE is_present = 1 AND is_mirrored = 0")
+        rows = cursor.fetchall()
+        conn.close()
+        return [Song.from_dict(dict(row)) for row in rows]
 
     @staticmethod
     def mark_offline(rel_paths: list[str]):
@@ -145,6 +192,9 @@ class DatabaseManager:
             
             cursor.execute("SELECT COUNT(*) FROM library WHERE is_present = 0")
             stats['offline_tracks'] = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM library WHERE is_present = 1 AND is_mirrored = 0")
+            stats['unmirrored_tracks'] = cursor.fetchone()[0]
 
             # Total duration (of online tracks)
             cursor.execute("SELECT SUM(duration) FROM library WHERE is_present = 1")

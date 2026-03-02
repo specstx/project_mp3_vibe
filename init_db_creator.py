@@ -15,7 +15,8 @@ def initialize_database(db_path="music_library.db"):
         "play_count INTEGER DEFAULT 0",
         "rating REAL DEFAULT 0.0",
         "last_played TEXT",
-        "is_present INTEGER DEFAULT 1"
+        "is_present INTEGER DEFAULT 1",
+        "is_mirrored INTEGER DEFAULT 0"
     ]
     for i in range(1, 21):
         columns.append(f"ext_{i} TEXT")

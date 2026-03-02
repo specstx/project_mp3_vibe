@@ -124,15 +124,18 @@ class ScannerThread(QThread):
                         print(f"MP3 read failed for {path_str}: {e}")
 
                     # 3. Post-processing & Sanitization
+                    needs_sync = False
                     if tracknumber:
                         was_changed, clean_tracknumber = sanitize_track_number(tracknumber)
                         if was_changed:
                             tags_to_fix.append((str(rel_file_path), clean_tracknumber))
+                            needs_sync = True
                     
                     if year:
                         was_year_changed, clean_year = sanitize_year(year)
                         if was_year_changed:
                             years_to_fix.append((str(rel_file_path), clean_year))
+                            needs_sync = True
 
                     # Snapshot updates
                     file_count += 1
@@ -151,7 +154,8 @@ class ScannerThread(QThread):
                         year=clean_year,
                         duration=duration,
                         rating=rating,
-                        is_present=1, # It's here
+                        is_present=1,
+                        is_mirrored=0 if needs_sync else 1, # Flag for sync if tags were 'fixed' during scan
                         ext_1=clean_tracknumber
                     )
                     song_batch.append(song)
@@ -243,6 +247,7 @@ class MetadataManager:
                 tag_data['ext_1'] = tag_data.pop('tracknumber')
 
             # Update the database
+            tag_data['is_mirrored'] = 0 # Mark for sync since tags changed
             song = Song(file_path=db_path, **tag_data) # Create a Song object from updated tags
             DatabaseManager.add_song(song) # This will update existing entry or add new one
 
@@ -343,6 +348,7 @@ class MetadataManager:
             song = DatabaseManager.get_song_by_path(db_path)
             if song:
                 song.rating = rating
+                song.is_mirrored = 0 # Mark for sync since rating changed
                 DatabaseManager.add_song(song) # Add_song will update the existing entry
             else:
                 print(f"Warning: Song not found in database for path: {db_path}. Cannot update rating in DB.")
