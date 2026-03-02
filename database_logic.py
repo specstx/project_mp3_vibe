@@ -267,6 +267,90 @@ class DatabaseManager:
             conn.close()
 
     @staticmethod
+    def get_top_tracks_by_playtime(limit=20):
+        """Retrieves top tracks based on total accumulated duration_played."""
+        conn = DatabaseManager._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        query = """
+            SELECT l.file_path, l.artist, l.title, SUM(p.duration_played) as total_resided, COUNT(p.id) as play_count
+            FROM library l
+            JOIN play_log p ON l.file_path = p.file_path
+            GROUP BY l.file_path
+            ORDER BY total_resided DESC
+            LIMIT ?
+        """
+        cursor.execute(query, (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def get_track_stickiness(limit=20):
+        """Calculates 'stickiness' (completion rate) for tracks with at least 3 plays."""
+        conn = DatabaseManager._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        query = """
+            SELECT l.artist, l.title, 
+                   (CAST(SUM(p.was_fully_played) AS FLOAT) / COUNT(p.id)) * 100 as stickiness,
+                   COUNT(p.id) as total_plays
+            FROM library l
+            JOIN play_log p ON l.file_path = p.file_path
+            GROUP BY l.file_path
+            HAVING total_plays >= 3
+            ORDER BY stickiness DESC, total_plays DESC
+            LIMIT ?
+        """
+        cursor.execute(query, (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def predict_next_track(rel_path):
+        """Finds the track most frequently played immediately after the given path."""
+        conn = DatabaseManager._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        # Find the IDs of the current track in the log
+        # Then look for the track that follows each ID
+        query = """
+            SELECT l.artist, l.title, COUNT(*) as frequency
+            FROM play_log p1
+            JOIN play_log p2 ON p2.id = p1.id + 1
+            JOIN library l ON l.file_path = p2.file_path
+            WHERE p1.file_path = ?
+            GROUP BY p2.file_path
+            ORDER BY frequency DESC
+            LIMIT 1
+        """
+        cursor.execute(query, (rel_path,))
+        row = cursor.fetchone()
+        conn.close()
+        return row
+
+    @staticmethod
+    def get_recent_trends(days=30):
+        """Top artists in the last N days."""
+        conn = DatabaseManager._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        query = """
+            SELECT l.artist, COUNT(*) as plays
+            FROM library l
+            JOIN play_log p ON l.file_path = p.file_path
+            WHERE p.timestamp >= date('now', ?)
+            GROUP BY l.artist
+            ORDER BY plays DESC
+            LIMIT 10
+        """
+        cursor.execute(query, (f'-{days} days',))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
     def get_song_by_path(filepath):
         conn = DatabaseManager._get_connection()
         conn.row_factory = sqlite3.Row

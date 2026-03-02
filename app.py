@@ -24,16 +24,23 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QSlider, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox, QCheckBox,
     QSplitter, QSizePolicy, QFrame, QStyle, QStackedWidget, QFormLayout, QLineEdit, QAbstractItemView,
-    QMenu, QMainWindow, QMenuBar)
+    QMenu, QMainWindow, QMenuBar, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QDialogButtonBox,
+    QComboBox, QGroupBox, QTabWidget)
 import signal
 import datetime
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint
-from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor, QAction
+import random
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QSize
+from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QCursor, QColor, QAction, QPainter, QBrush, QPen
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from config import load_config, save_config
 from metadata import ScannerThread, MetadataManager, PROJECT_DIR, create_library_snapshot
 from database_logic import DatabaseManager
 from pathlib import Path
+import musicbrainzngs
+
+# Initialize MusicBrainz
+musicbrainzngs.set_useragent("MP3VibePlayer", "0.1", "https://github.com/specstx/project_mp3_vibe")
+
 DEFAULT_MUSIC_PATH = str(Path.home() / "Music")
 # ------------------------
 # Background scanner thread
@@ -359,6 +366,475 @@ class TreePopulationThread(QThread):
         except (ValueError, TypeError):
             return 0
 
+class ExtendedTagsDialog(QDialog):
+    def __init__(self, abs_path, rel_path, parent=None):
+        super().__init__(parent)
+        self.abs_path = abs_path
+        self.rel_path = rel_path
+        self.setWindowTitle(f"Extended Tags: {Path(rel_path).name}")
+        self.resize(500, 400)
+        
+        self.layout = QVBoxLayout(self)
+        
+        # Table for tags
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Tag Key", "Value"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.layout.addWidget(self.table)
+        
+        # Load tags
+        self.tags = MetadataManager.get_extended_tags(abs_path)
+        self.populate_table()
+        
+        # Buttons
+        self.btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.btn_box.accepted.connect(self.save_and_close)
+        self.btn_box.rejected.connect(self.reject)
+        self.layout.addWidget(self.btn_box)
+
+    def populate_table(self):
+        self.table.setRowCount(len(self.tags))
+        for i, (key, value) in enumerate(sorted(self.tags.items())):
+            key_item = QTableWidgetItem(key)
+            key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable) # Key is read-only
+            self.table.setItem(i, 0, key_item)
+            self.table.setItem(i, 1, QTableWidgetItem(str(value)))
+
+    def save_and_close(self):
+        new_tags = {}
+        for i in range(self.table.rowCount()):
+            key = self.table.item(i, 0).text()
+            val = self.table.item(i, 1).text()
+            new_tags[key] = val
+            
+        if MetadataManager.save_extended_tags(self.abs_path, new_tags, rel_path=self.rel_path):
+            self.accept()
+        else:
+            QMessageBox.critical(self, "Error", "Failed to save extended tags.")
+
+class EqualizerWidget(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+        self.setObjectName("Equalizer")
+        self.setFixedHeight(120)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(2)
+        
+        # Header
+        header = QHBoxLayout()
+        title = QLabel("10-Band Equalizer")
+        title.setStyleSheet("font-weight: bold; color: #FFC107;")
+        header.addWidget(title)
+        
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["Flat", "Rock", "Pop", "Jazz", "Classical", "Vibe"])
+        self.preset_combo.setFixedWidth(80)
+        header.addWidget(self.preset_combo)
+        
+        self.on_off = QCheckBox("On")
+        self.on_off.setChecked(True)
+        header.addWidget(self.on_off)
+        layout.addLayout(header)
+        
+        # Sliders
+        slider_row = QHBoxLayout()
+        self.sliders = []
+        bands = ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+        
+        for band in bands:
+            v_box = QVBoxLayout()
+            slider = QSlider(Qt.Orientation.Vertical)
+            slider.setRange(-12, 12)
+            slider.setValue(0)
+            slider.setFixedHeight(60)
+            self.sliders.append(slider)
+            
+            lbl = QLabel(band)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("font-size: 8px; color: #A78BFA;")
+            
+            v_box.addWidget(slider)
+            v_box.addWidget(lbl)
+            slider_row.addLayout(v_box)
+            
+        layout.addLayout(slider_row)
+
+class VisualizerWidget(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        self.setFixedHeight(100)
+        self.setStyleSheet("background-color: black;")
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.is_active = False
+        
+        self.bars = 32
+        self.heights = [0] * self.bars
+
+    def start(self):
+        self.is_active = True
+        self.timer.start(50) # 20 FPS
+
+    def stop(self):
+        self.is_active = False
+        self.timer.stop()
+        self.heights = [0] * self.bars
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        w = self.width()
+        h = self.height()
+        bar_w = w / self.bars
+        
+        for i in range(self.bars):
+            if self.is_active:
+                # Random "vibe" simulation
+                target = random.randint(5, h - 5)
+                # Smooth movement
+                self.heights[i] = self.heights[i] * 0.6 + target * 0.4
+            else:
+                self.heights[i] = max(0, self.heights[i] - 5)
+
+            # Gradient color from violet to amber
+            color = QColor("#A78BFA") # Violet
+            if self.heights[i] > h * 0.7:
+                color = QColor("#FFC107") # Amber for peaks
+            
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            
+            painter.drawRect(int(i * bar_w), int(h - self.heights[i]), int(bar_w - 2), int(self.heights[i]))
+
+class CaseConversionDialog(QDialog):
+    def __init__(self, current_tags, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Case Conversion")
+        self.resize(350, 250)
+        self.result_tags = None
+        
+        layout = QVBoxLayout(self)
+        
+        # Rule selection
+        self.rule_combo = QComboBox()
+        self.rule_combo.addItems([
+            "Title Case (Every Word Capitalized)",
+            "Sentence case (First word capitalized)",
+            "UPPERCASE",
+            "lowercase",
+            "Trim Whitespace ($trim)"
+        ])
+        layout.addWidget(QLabel("Conversion Rule:"))
+        layout.addWidget(self.rule_combo)
+        
+        # Tag selection (Checkboxes)
+        layout.addWidget(QLabel("Apply to:"))
+        self.check_boxes = {}
+        for tag in ["artist", "title", "album", "genre"]:
+            cb = QCheckBox(tag.capitalize())
+            cb.setChecked(True)
+            self.check_boxes[tag] = cb
+            layout.addWidget(cb)
+            
+        # Preview
+        self.preview_label = QLabel("<i>Select a rule to see preview</i>")
+        self.preview_label.setWordWrap(True)
+        layout.addWidget(self.preview_label)
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.apply_rule)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+        self.current_tags = current_tags
+        self.rule_combo.currentIndexChanged.connect(self.update_preview)
+        self.update_preview()
+
+    def update_preview(self):
+        rule = self.rule_combo.currentText()
+        test_val = "the BEATLES - abbey ROAD"
+        preview = self.transform_text(test_val, rule)
+        self.preview_label.setText(f"Preview: <b>{preview}</b>")
+
+    def transform_text(self, text, rule):
+        if not text: return ""
+        if "Title Case" in rule:
+            return text.title()
+        elif "Sentence case" in rule:
+            return text.capitalize()
+        elif "UPPERCASE" in rule:
+            return text.upper()
+        elif "lowercase" in rule:
+            return text.lower()
+        elif "Trim" in rule:
+            return text.strip()
+        return text
+
+    def apply_rule(self):
+        rule = self.rule_combo.currentText()
+        self.result_tags = self.current_tags.copy()
+        
+        for tag, cb in self.check_boxes.items():
+            if cb.isChecked():
+                old_val = self.result_tags.get(tag, "")
+                self.result_tags[tag] = self.transform_text(old_val, rule)
+        self.accept()
+
+class CharReplacementDialog(QDialog):
+    def __init__(self, current_tags, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Character Replacement")
+        self.resize(350, 300)
+        self.result_tags = None
+        
+        layout = QVBoxLayout(self)
+        
+        # Replacement inputs
+        grid = QFormLayout()
+        self.replace_input = QLineEdit("_")
+        self.with_input = QLineEdit(" ")
+        grid.addRow("Replace:", self.replace_input)
+        grid.addRow("With:", self.with_input)
+        layout.addLayout(grid)
+        
+        # Tag selection
+        layout.addWidget(QLabel("Apply to:"))
+        self.check_boxes = {}
+        for tag in ["artist", "title", "album", "genre"]:
+            cb = QCheckBox(tag.capitalize())
+            cb.setChecked(True)
+            self.check_boxes[tag] = cb
+            layout.addWidget(cb)
+            
+        # Preview
+        self.preview_label = QLabel("Preview: <b>...</b>")
+        layout.addWidget(self.preview_label)
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.apply_replacement)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+        self.current_tags = current_tags
+        self.replace_input.textChanged.connect(self.update_preview)
+        self.with_input.textChanged.connect(self.update_preview)
+        self.update_preview()
+
+    def update_preview(self):
+        old = self.replace_input.text()
+        new = self.with_input.text()
+        test_val = "Artist_-_Song_Title"
+        preview = test_val.replace(old, new) if old else test_val
+        self.preview_label.setText(f"Preview: <b>{preview}</b>")
+
+    def apply_replacement(self):
+        old = self.replace_input.text()
+        new = self.with_input.text()
+        if not old:
+            self.reject()
+            return
+            
+        self.result_tags = self.current_tags.copy()
+        for tag, cb in self.check_boxes.items():
+            if cb.isChecked():
+                val = self.result_tags.get(tag, "")
+                self.result_tags[tag] = val.replace(old, new)
+        self.accept()
+
+class MusicBrainzLookupDialog(QDialog):
+    def __init__(self, current_tags, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MusicBrainz Metadata Lookup")
+        self.resize(700, 500)
+        self.result_tags = None
+        self.current_tags = current_tags
+        
+        layout = QVBoxLayout(self)
+        
+        # Search Inputs
+        search_row = QHBoxLayout()
+        self.artist_input = QLineEdit(current_tags.get('artist', ''))
+        self.title_input = QLineEdit(current_tags.get('title', ''))
+        search_row.addWidget(QLabel("Artist:"))
+        search_row.addWidget(self.artist_input)
+        search_row.addWidget(QLabel("Title:"))
+        search_row.addWidget(self.title_input)
+        
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self.perform_search)
+        search_row.addWidget(self.search_btn)
+        layout.addLayout(search_row)
+        
+        # Results Table
+        self.results_table = QTableWidget(0, 4)
+        self.results_table.setHorizontalHeaderLabels(["Score", "Title", "Artist", "Album / Release"])
+        self.results_table.horizontalHeader().setStretchLastSection(True)
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.results_table.itemSelectionChanged.connect(self.update_preview)
+        layout.addWidget(self.results_table)
+        
+        # Comparison Preview
+        self.preview_box = QGroupBox("Comparison Preview (Current vs. New)")
+        preview_layout = QFormLayout(self.preview_box)
+        self.comp_labels = {}
+        for tag in ["Artist", "Title", "Album", "Year", "Genre"]:
+            lbl = QLabel("---")
+            lbl.setStyleSheet("color: #00E676;") # Green for new data
+            self.comp_labels[tag] = lbl
+            preview_layout.addRow(f"{tag}:", lbl)
+        layout.addWidget(self.preview_box)
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        self.apply_btn = btns.button(QDialogButtonBox.StandardButton.Apply)
+        self.apply_btn.setEnabled(False)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+        self.search_results = []
+
+    def perform_search(self):
+        artist = self.artist_input.text().strip()
+        title = self.title_input.text().strip()
+        
+        if not artist and not title: return
+        
+        try:
+            # Search recording
+            query = f'recording:"{title}" AND artist:"{artist}"'
+            result = musicbrainzngs.search_recordings(query=query, limit=15)
+            self.search_results = result.get('recording-list', [])
+            
+            self.results_table.setRowCount(len(self.search_results))
+            for i, rec in enumerate(self.search_results):
+                score = rec.get('ext:score', '0')
+                title = rec.get('title', 'Unknown')
+                artist = rec.get('artist-credit-phrase', 'Unknown')
+                # Album info is under 'release-list'
+                releases = rec.get('release-list', [])
+                album = releases[0].get('title', 'N/A') if releases else "N/A"
+                
+                self.results_table.setItem(i, 0, QTableWidgetItem(score))
+                self.results_table.setItem(i, 1, QTableWidgetItem(title))
+                self.results_table.setItem(i, 2, QTableWidgetItem(artist))
+                self.results_table.setItem(i, 3, QTableWidgetItem(album))
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Search Error", f"MusicBrainz search failed: {e}")
+
+    def update_preview(self):
+        row = self.results_table.currentRow()
+        if row < 0: return
+        
+        rec = self.search_results[row]
+        releases = rec.get('release-list', [])
+        rel = releases[0] if releases else {}
+        
+        new_data = {
+            "Artist": rec.get('artist-credit-phrase', 'Unknown'),
+            "Title": rec.get('title', 'Unknown'),
+            "Album": rel.get('title', 'N/A'),
+            "Year": rel.get('date', 'N/A')[:4] if rel.get('date') else 'N/A',
+            "Genre": "N/A" # MusicBrainz genres are complex, often omitted in basic search
+        }
+        
+        for tag, lbl in self.comp_labels.items():
+            curr = self.current_tags.get(tag.lower(), "---")
+            lbl.setText(f"{curr}  →  {new_data[tag]}")
+            
+        self.apply_btn.setEnabled(True)
+        # Store for the apply action
+        self.result_tags = {
+            "artist": new_data["Artist"],
+            "title": new_data["Title"],
+            "album": new_data["Album"],
+            "date": new_data["Year"]
+        }
+
+class AdvancedStatsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sovereign Insights - Advanced Metrics")
+        self.resize(800, 600)
+        
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # 1. Heavy Rotation Tab
+        self.rotation_tab = QWidget()
+        self.rotation_layout = QVBoxLayout(self.rotation_tab)
+        self.rotation_table = QTableWidget(0, 4)
+        self.rotation_table.setHorizontalHeaderLabels(["Artist", "Title", "Actual Time Played", "Plays"])
+        self.rotation_table.horizontalHeader().setStretchLastSection(True)
+        self.rotation_layout.addWidget(self.rotation_table)
+        self.tabs.addTab(self.rotation_tab, "Heavy Rotation")
+        
+        # 2. Stickiness Tab
+        self.stick_tab = QWidget()
+        self.stick_layout = QVBoxLayout(self.stick_tab)
+        self.stick_table = QTableWidget(0, 3)
+        self.stick_table.setHorizontalHeaderLabels(["Artist", "Title", "Completion Rate (%)"])
+        self.stick_table.horizontalHeader().setStretchLastSection(True)
+        self.stick_layout.addWidget(self.stick_table)
+        self.tabs.addTab(self.stick_tab, "Stickiness (No-Skip)")
+        
+        # 3. Trends Tab
+        self.trend_tab = QWidget()
+        self.trend_layout = QVBoxLayout(self.trend_tab)
+        self.trend_table = QTableWidget(0, 2)
+        self.trend_table.setHorizontalHeaderLabels(["Artist", "Plays (Last 30 Days)"])
+        self.trend_table.horizontalHeader().setStretchLastSection(True)
+        self.trend_layout.addWidget(self.trend_table)
+        self.tabs.addTab(self.trend_tab, "Recent Trends")
+        
+        self.load_data()
+
+    def _format_time(self, seconds):
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours}h {mins}m {secs}s"
+        return f"{mins}m {secs}s"
+
+    def load_data(self):
+        # Rotation
+        top_tracks = DatabaseManager.get_top_tracks_by_playtime()
+        self.rotation_table.setRowCount(len(top_tracks))
+        for i, row in enumerate(top_tracks):
+            self.rotation_table.setItem(i, 0, QTableWidgetItem(row['artist']))
+            self.rotation_table.setItem(i, 1, QTableWidgetItem(row['title']))
+            self.rotation_table.setItem(i, 2, QTableWidgetItem(self._format_time(row['total_resided'])))
+            self.rotation_table.setItem(i, 3, QTableWidgetItem(str(row['play_count'])))
+            
+        # Stickiness
+        sticky = DatabaseManager.get_track_stickiness()
+        self.stick_table.setRowCount(len(sticky))
+        for i, row in enumerate(sticky):
+            self.stick_table.setItem(i, 0, QTableWidgetItem(row['artist']))
+            self.stick_table.setItem(i, 1, QTableWidgetItem(row['title']))
+            self.stick_table.setItem(i, 2, QTableWidgetItem(f"{row['stickiness']:.1f}%"))
+            
+        # Trends
+        trends = DatabaseManager.get_recent_trends()
+        self.trend_table.setRowCount(len(trends))
+        for i, row in enumerate(trends):
+            self.trend_table.setItem(i, 0, QTableWidgetItem(row['artist']))
+            self.trend_table.setItem(i, 1, QTableWidgetItem(str(row['plays'])))
+
 # ------------------------
 # Main Window
 # ------------------------
@@ -416,6 +892,12 @@ class MP3Player(QMainWindow):
         # Custom volume control
         self.volume_control = VolumeControlWidget()
         self.volume_control.setAudioOutput(self.audio_output)
+
+        # Equalizer & Visualizer (Placeholders)
+        self.equalizer_widget = EqualizerWidget()
+        self.visualizer_widget = VisualizerWidget()
+        self.equalizer_widget.hide() # Hidden by default
+        self.visualizer_widget.hide() # Hidden by default
 
         # Menu Bar
         self.init_menubar()
@@ -823,7 +1305,20 @@ class MP3Player(QMainWindow):
             f"Highly Rated (4.0+): {stats['top_rated_count']}"
         )
         
-        QMessageBox.information(self, "Database Statistics", msg)
+        box = QMessageBox(self)
+        box.setWindowTitle("Database Statistics")
+        box.setText(msg)
+        box.setIcon(QMessageBox.Icon.Information)
+        
+        # Add a custom button for Advanced Stats
+        adv_btn = box.addButton("Advanced Stats...", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        
+        box.exec()
+        
+        if box.clickedButton() == adv_btn:
+            dlg = AdvancedStatsDialog(self)
+            dlg.exec()
 
     def prune_offline_tracks(self):
         """Permanently deletes songs that are marked as offline."""
@@ -882,7 +1377,24 @@ class MP3Player(QMainWindow):
         # Fallback to current playing path if nothing selected
         return self.current_mp3_path
 
-    def show_extended_tags(self): pass
+    def show_extended_tags(self):
+        """Opens the deep tag editor for the selected track."""
+        rel_path = self._get_selected_rel_path()
+        if not rel_path:
+            QMessageBox.information(self, "Extended Tags", "Please select a track first.")
+            return
+
+        abs_path = os.path.join(self.music_path, rel_path)
+        if not os.path.exists(abs_path):
+            QMessageBox.critical(self, "Error", f"File not found: {rel_path}")
+            return
+
+        dlg = ExtendedTagsDialog(abs_path, rel_path, self)
+        if dlg.exec():
+            # If saved, refresh the UI info
+            self.load_track_info(rel_path)
+            self.populate_tree() # Full refresh to update grid if Genre/Artist changed
+            QMessageBox.information(self, "Success", "Extended tags saved successfully.")
 
     def show_file_properties(self):
         """Displays technical properties for the selected track."""
@@ -904,9 +1416,105 @@ class MP3Player(QMainWindow):
         
         QMessageBox.information(self, "Track Properties", msg)
     
-    def tool_case_conversion(self): pass
-    def tool_char_replacement(self): pass
-    def tool_autonumbering(self): pass
+    def tool_case_conversion(self):
+        """Applies casing rules to tags of the selected track."""
+        rel_path = self._get_selected_rel_path()
+        if not rel_path:
+            QMessageBox.information(self, "Case Conversion", "Please select a track first.")
+            return
+
+        abs_path = os.path.join(self.music_path, rel_path)
+        if not os.path.exists(abs_path):
+            QMessageBox.critical(self, "Error", f"File not found: {rel_path}")
+            return
+
+        # Load current tags
+        tags, _ = MetadataManager.load_tags_and_art(abs_path)
+        
+        dlg = CaseConversionDialog(tags, self)
+        if dlg.exec():
+            # If Ok, save the transformed tags
+            if MetadataManager.save_tags(abs_path, dlg.result_tags, rel_path=rel_path):
+                self.load_track_info(rel_path)
+                self.populate_tree()
+                QMessageBox.information(self, "Success", "Case conversion applied successfully.")
+            else:
+                QMessageBox.critical(self, "Error", "Failed to apply case conversion.")
+    def tool_char_replacement(self):
+        """Replaces characters/strings in tags of the selected track."""
+        rel_path = self._get_selected_rel_path()
+        if not rel_path:
+            QMessageBox.information(self, "Character Replacement", "Please select a track first.")
+            return
+
+        abs_path = os.path.join(self.music_path, rel_path)
+        if not os.path.exists(abs_path):
+            QMessageBox.critical(self, "Error", f"File not found: {rel_path}")
+            return
+
+        # Load current tags
+        tags, _ = MetadataManager.load_tags_and_art(abs_path)
+        
+        dlg = CharReplacementDialog(tags, self)
+        if dlg.exec():
+            # If Ok, save the transformed tags
+            if MetadataManager.save_tags(abs_path, dlg.result_tags, rel_path=rel_path):
+                self.load_track_info(rel_path)
+                self.populate_tree()
+                QMessageBox.information(self, "Success", "Character replacement applied successfully.")
+            else:
+                QMessageBox.critical(self, "Error", "Failed to apply character replacement.")
+    def tool_autonumbering(self):
+        """Sequentially re-numbers tracks in the selected album."""
+        item = self.tree.currentItem()
+        if not item:
+            QMessageBox.information(self, "Autonumbering", "Please select an Album folder in the library tree.")
+            return
+            
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get('type') != 'album':
+            QMessageBox.information(self, "Autonumbering", "This tool only works on Album folders.")
+            return
+
+        # Collect all tracks under this album item
+        track_items = []
+        for i in range(item.childCount()):
+            child = item.child(i)
+            c_data = child.data(0, Qt.ItemDataRole.UserRole)
+            if c_data and c_data.get('type') == 'track':
+                track_items.append(child)
+
+        if not track_items:
+            QMessageBox.information(self, "Autonumbering", "No tracks found in this album.")
+            return
+
+        # Show confirmation with preview
+        msg = f"<b>Autonumbering Wizard</b><br><br>Album: {item.text(0)}<br><br>"
+        msg += "This will re-number the following tracks sequentially (1, 2, 3...):<br><br>"
+        for i, t_item in enumerate(track_items, 1):
+            msg += f"{i}. {t_item.text(0)}<br>"
+        
+        reply = QMessageBox.question(
+            self, "Autonumbering", msg,
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        )
+        
+        if reply == QMessageBox.StandardButton.Ok:
+            self.now_playing_label.setText("Autonumbering Album...")
+            QApplication.processEvents()
+            
+            success_count = 0
+            for i, t_item in enumerate(track_items, 1):
+                rel_path = t_item.data(0, Qt.ItemDataRole.UserRole).get('path')
+                abs_path = os.path.join(self.music_path, rel_path)
+                
+                # Save only the tracknumber
+                if MetadataManager.save_tags(abs_path, {'tracknumber': str(i)}, rel_path=rel_path):
+                    success_count += 1
+            
+            self.populate_tree()
+            QMessageBox.information(self, "Success", f"Successfully re-numbered {success_count} tracks.")
+            self.now_playing_label.setText("Ready")
     def tool_integrity_check(self):
         """Audits the library for missing metadata and logs details."""
         songs = DatabaseManager.get_present_songs()
@@ -960,13 +1568,67 @@ class MP3Player(QMainWindow):
         else:
             QMessageBox.information(self, "Ingestion Report", "No ingestion report found.")
 
-    def tagger_musicbrainz_lookup(self): pass
+    def tagger_musicbrainz_lookup(self):
+        """Fetches metadata from MusicBrainz for the selected track."""
+        rel_path = self._get_selected_rel_path()
+        if not rel_path:
+            QMessageBox.information(self, "MusicBrainz Lookup", "Please select a track first.")
+            return
+
+        abs_path = os.path.join(self.music_path, rel_path)
+        if not os.path.exists(abs_path):
+            QMessageBox.critical(self, "Error", f"File not found: {rel_path}")
+            return
+
+        # Load current tags
+        tags, _ = MetadataManager.load_tags_and_art(abs_path)
+        
+        dlg = MusicBrainzLookupDialog(tags, self)
+        if dlg.exec():
+            # Strict Confirmation Box
+            new_data = dlg.result_tags
+            msg = (
+                f"<b>Confirm Tag Update</b><br><br>"
+                f"Are you sure you want to overwrite tags for:<br><i>{Path(rel_path).name}</i><br><br>"
+                f"<b>Artist:</b> {new_data['artist']}<br>"
+                f"<b>Title:</b> {new_data['title']}<br>"
+                f"<b>Album:</b> {new_data['album']}<br>"
+                f"<b>Year:</b> {new_data['date']}"
+            )
+            
+            confirm = QMessageBox.question(
+                self, "MusicBrainz Confirmation", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if confirm == QMessageBox.StandardButton.Yes:
+                if MetadataManager.save_tags(abs_path, new_data, rel_path=rel_path):
+                    self.load_track_info(rel_path)
+                    self.populate_tree()
+                    QMessageBox.information(self, "Success", "Metadata updated from MusicBrainz.")
+                else:
+                    QMessageBox.critical(self, "Error", "Failed to save tags.")
+
     def tagger_cluster_files(self): pass
     def tagger_scan_fingerprints(self): pass
     
-    def toggle_equalizer(self, checked): pass
+    def toggle_equalizer(self, checked):
+        if checked:
+            self.equalizer_widget.show()
+        else:
+            self.equalizer_widget.hide()
+
     def toggle_waveform(self, checked): pass
-    def toggle_visualizer(self, checked): pass
+
+    def toggle_visualizer(self, checked):
+        if checked:
+            self.visualizer_widget.show()
+            # Start animation only if playing
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.visualizer_widget.start()
+        else:
+            self.visualizer_widget.stop()
+            self.visualizer_widget.hide()
     
     def sync_audit_mirror(self): pass
     def sync_hash_verification(self): pass
@@ -1084,6 +1746,10 @@ class MP3Player(QMainWindow):
         self.now_playing_label.setMinimumHeight(30)
         self.now_playing_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         right_v.addWidget(self.now_playing_label)
+
+        # Add Visualizer and Equalizer here
+        right_v.addWidget(self.visualizer_widget)
+        right_v.addWidget(self.equalizer_widget)
 
         # --- Row 2: Control row ---
         control_row = QHBoxLayout()
@@ -2173,10 +2839,15 @@ class MP3Player(QMainWindow):
             # switch to pause icon
             self.play_btn.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_MediaPause))
             self.play_btn.setToolTip("Pause")
+            # Start visualizer if visible
+            if self.visualizer_widget.isVisible():
+                self.visualizer_widget.start()
         else:
             # switch to play icon
             self.play_btn.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
             self.play_btn.setToolTip("Play")
+            # Stop visualizer
+            self.visualizer_widget.stop()
 
     def on_seek_pressed(self):
         self._seeking = True
