@@ -1948,23 +1948,34 @@ class MP3Player(QMainWindow):
         
         self.now_playing_label.setText("Ready")
 
+    def open_with_default_application(self, path):
+        """Cross-platform way to open a file or directory with its default application."""
+        import platform
+        if not os.path.exists(path):
+            return
+            
+        system = platform.system()
+        try:
+            if system == "Darwin":  # macOS
+                subprocess.run(["open", path])
+            elif system == "Windows":
+                os.startfile(path)
+            else:  # Linux and others
+                subprocess.run(["xdg-open", path])
+        except Exception as e:
+            print(f"Error opening {path}: {e}")
+
     def tool_open_audit_log(self):
         """Opens the audit_log.txt file in the system default editor."""
         log_path = os.path.join(PROJECT_DIR, "audit_log.txt")
-        if os.path.exists(log_path):
-            subprocess.run(["xdg-open", log_path])
-        else:
-            QMessageBox.information(self, "Audit Log", "No audit log found.")
+        self.open_with_default_application(log_path)
 
     def file_open_ingestion_report(self):
         """Opens the ingestion_report.txt file in the system default editor."""
         # Find the parking folder from SovereignSync defaults
         from sovereign_sync import DEFAULT_SOURCE
         report_path = os.path.join(DEFAULT_SOURCE, "ingestion_report.txt")
-        if os.path.exists(report_path):
-            subprocess.run(["xdg-open", report_path])
-        else:
-            QMessageBox.information(self, "Ingestion Report", "No ingestion report found.")
+        self.open_with_default_application(report_path)
 
     def tagger_musicbrainz_lookup(self):
         """Fetches metadata from MusicBrainz for the selected track."""
@@ -3013,9 +3024,7 @@ class MP3Player(QMainWindow):
         if not rel_path: return
         abs_path = os.path.join(self.music_path, rel_path)
         folder = os.path.dirname(abs_path)
-        if os.path.exists(folder):
-            # Use xdg-open for Linux portability
-            subprocess.run(["xdg-open", folder])
+        self.open_with_default_application(folder)
 
     def copy_tags_to_clipboard(self, rel_path):
         if not rel_path: return
