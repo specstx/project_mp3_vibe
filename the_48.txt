@@ -1,0 +1,65 @@
+--- Metadata Audit: 21 Tracks Found ---
+
+FILE: Pop/Singles/Kane Brown - One Thing Right.mp3
+MISSING: Album
+----------------------------------------
+FILE: Pop/Singles/Sam Smith - Dancing With A Stranger.mp3
+MISSING: Album
+----------------------------------------
+FILE: Female/Orla Gartland/Woman on the Internet (2021)/Orla Gartland - Codependency.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Ingrid Michaelson/Lights Out (2014)/Ingrid Michaelson - Afterlife.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Mallory Merk/Counterparts (2021)/Mallory Merk - Just Because.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Natasha Bedingfield/Pocketful of Sunshine (2008)/Natasha Bedingfield - Pocketful of Sunshine.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Bailey Spinn/loser (2025)/bailey spinn - happy ending.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Maggie Rogers/Surrender (2022)/Maggie Rogers - Shatter.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Nina Nesbitt/Nina Nesbitt (2014)/Nina Nesbitt - Statues.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Caitlyn Smith/Supernova (2020)/Caitlyn Smith - I Don't Want to Love You Anymore.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Avril Lavigne/Head Above Water (2019)/Avril Lavigne - Head Above Water.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Rachel Chinouriri/What a Devastating Turn of Events (2024)/Rachel Chinouriri - Never Need Me.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Carter Faith/Let Love Be Love (2021)/Carter Faith - Cowboys & Dreamers.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Christina Perri/A Lighter Shade of Blue (2022)/christina perri - evergone.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Caylee Hammack/Bed Of Roses (2025)/Caylee Hammack - No I Ain't.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Emily Linge/Ever Since (2022)/Emily Linge - Ever Since.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Echosmith/Lonely Generation (2020)/Echosmith - Love You Better.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Ashley Monroe/Tennessee Lightning (2025)/Ashley Monroe - Bitter Swisher Sweet.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Tenille Townes/Girl Who Didn't Care (2021)/Tenille Townes - Girl Who Didn't Care.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Ingrid Andress/Lady Like (2020)/Ingrid Andress - The Stranger.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------
+FILE: Female/Lindsay Ell/That Don’t Impress Me Much (2022)/Lindsay Ell - That Don't Impress Me Much.mp3
+MISSING: Artist, Title, Album, Genre
+----------------------------------------

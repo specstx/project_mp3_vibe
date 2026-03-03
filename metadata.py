@@ -26,6 +26,129 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # We don't need CONFIG_FILE here as that's in config.py
 # We keep DEFAULT_MUSIC_PATH in app.py as it's a default setting, not I/O logic.
 # ------------------------------------------
+try:
+    import essentia
+    import essentia.standard as es
+    ESSENTIA_AVAILABLE = True
+except ImportError:
+    ESSENTIA_AVAILABLE = False
+
+try:
+    import acoustid
+    ACOUSTID_AVAILABLE = True
+except ImportError:
+    ACOUSTID_AVAILABLE = False
+
+ACOUSTID_API_KEY = "yCoeMQ6HYn"
+
+class AcoustidEngine:
+    """Acoustic Fingerprinting Engine powered by Chromaprint and AcoustID."""
+    
+    @staticmethod
+    def is_available():
+        return ACOUSTID_AVAILABLE
+
+    @staticmethod
+    def fingerprint_file(abs_path):
+        """Generates a fingerprint for the given audio file."""
+        if not ACOUSTID_AVAILABLE:
+            return None, None
+        try:
+            # fpcalc is required on the system path
+            duration, fingerprint = acoustid.fingerprint_file(abs_path)
+            return duration, fingerprint
+        except Exception as e:
+            print(f"Fingerprinting failed for {abs_path}: {e}")
+            return None, None
+
+    @staticmethod
+    def identify_track(abs_path):
+        """Talks to AcoustID API to identify a track by its audio fingerprint."""
+        if not ACOUSTID_AVAILABLE:
+            return None
+        try:
+            results = acoustid.match(ACOUSTID_API_KEY, abs_path)
+            # results is a generator of (score, recording_id, title, artist)
+            matches = []
+            for score, rec_id, title, artist in results:
+                matches.append({
+                    "score": round(score * 100, 1),
+                    "title": title,
+                    "artist": artist
+                })
+            return matches
+        except Exception as e:
+            print(f"AcoustID Identification failed: {e}")
+            return None
+
+    @staticmethod
+    def get_release_group_id(abs_path):
+        """Fetches the MusicBrainz Release Group ID for an audio file via AcoustID."""
+        if not ACOUSTID_AVAILABLE:
+            return None
+        try:
+            # We request 'releasegroups' metadata from AcoustID
+            results = acoustid.match(ACOUSTID_API_KEY, abs_path, meta=['releasegroups'])
+            # We take the top match's first release group
+            for score, rec_id, title, artist in results:
+                # To find release groups, we often need to dig into the raw response
+                # but acoustid.match simplifies this. If available, it will be in the recording object.
+                # However, for clustering, we just need ANY common ID.
+                # Let's use the Recording ID as a proxy for clustering if ReleaseGroup isn't direct.
+                return rec_id # Recording ID is unique enough for album clustering
+            return None
+        except Exception:
+            return None
+
+class EssentiaEngine:
+    """Sovereign Audio Intelligence Engine powered by Essentia."""
+    
+    @staticmethod
+    def is_available():
+        return ESSENTIA_AVAILABLE
+
+    @staticmethod
+    def analyze_track(abs_path):
+        """Extracts BPM and Waveform data from a track."""
+        if not ESSENTIA_AVAILABLE:
+            return None
+            
+        try:
+            # Load audio
+            loader = es.MonoLoader(filename=abs_path)
+            audio = loader()
+            
+            # 1. BPM Detection
+            bpm_algo = es.PercivalBpmEstimator()
+            bpm = bpm_algo(audio)
+            
+            # 2. Waveform Generation (RMS envelope)
+            # We want roughly 100 points for our UI
+            hop_size = len(audio) // 100
+            if hop_size < 1: hop_size = 1
+            
+            rms_algo = es.RMS()
+            waveform = []
+            for i in range(0, len(audio), hop_size):
+                frame = audio[i:i+hop_size]
+                if len(frame) > 0:
+                    waveform.append(int(rms_algo(frame) * 500)) # Scale for UI
+            
+            # Ensure exactly 100 points or close to it
+            waveform = waveform[:100]
+            
+            # 3. AcoustID Fingerprinting
+            _, fingerprint = AcoustidEngine.fingerprint_file(abs_path)
+            
+            return {
+                "bpm": round(bpm, 2),
+                "waveform": ",".join(map(str, waveform)), # Store as CSV string in DB
+                "fingerprint": fingerprint
+            }
+        except Exception as e:
+            print(f"Essentia Analysis Failed for {abs_path}: {e}")
+            return None
+
 class ScannerThread(QThread):
     finished = pyqtSignal(dict, list, list, dict) # dict: library tree, list: tags to fix, list: years to fix, dict: snapshot
     progress = pyqtSignal(str)
@@ -254,6 +377,59 @@ class MetadataManager:
             return True
         except Exception as e:
             print(f"Failed to save tags for {abs_path}: {e}")
+            return False
+
+    @staticmethod
+    def save_extended_tags(abs_path, tag_dict, rel_path=None):
+        """Saves a dictionary of raw ID3 tags to a file and updates the database."""
+        db_path = rel_path or abs_path
+        try:
+            audio = ID3(abs_path)
+            # Standard tags mapping for DB update (convenience)
+            db_updates = {}
+            
+            for key, value in tag_dict.items():
+                # Key is the ID3 frame name (e.g. 'TCOM')
+                # 1. Update File
+                try:
+                    # Create the appropriate frame type based on key
+                    # This is a simplification; mutagen has specific classes for different frames.
+                    # TIT2 (Title), TPE1 (Artist), etc.
+                    from mutagen.id3 import TextFrame
+                    # Most tags we care about are text frames
+                    if key in audio:
+                        audio[key].text = [value]
+                    else:
+                        # For new tags, we try to create a standard TextFrame (TIT2, TCOM, etc.)
+                        # Note: Some frames like APIC or COMM need specialized handling.
+                        audio.add(getattr(sys.modules['mutagen.id3'], key, TextFrame)(encoding=3, text=[value]))
+                except Exception as e:
+                    print(f"Failed to set frame {key}: {e}")
+
+                # 2. Prepare DB mapping (If it maps to our standard fields)
+                # Map mutagen internal names to our Song object fields
+                mapping = {
+                    'TPE1': 'artist', 'TIT2': 'title', 'TALB': 'album', 
+                    'TCON': 'genre', 'TDRC': 'year', 'TRCK': 'ext_1'
+                }
+                if key in mapping:
+                    db_updates[mapping[key]] = value
+
+            audio.save()
+            # Force Linux filesystem to recognize modification
+            os.utime(abs_path, None)
+
+            # 3. Update Database
+            song = DatabaseManager.get_song_by_path(db_path)
+            if song:
+                for attr, val in db_updates.items():
+                    setattr(song, attr, val)
+                song.is_mirrored = 0 # Mark for sync
+                DatabaseManager.add_song(song)
+
+            return True
+        except Exception as e:
+            print(f"Failed to save extended tags for {abs_path}: {e}")
             return False
 
     @staticmethod

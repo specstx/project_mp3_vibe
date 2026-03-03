@@ -222,6 +222,45 @@ class YearFixerThread(QThread):
         self.finished.emit(successful, failed)
 
 
+class DeepScannerThread(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)
+
+    def __init__(self, music_path):
+        super().__init__()
+        self.music_path = music_path
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+    def run(self):
+        from metadata import EssentiaEngine
+        songs = DatabaseManager.get_present_songs()
+        count = 0
+        
+        for s in songs:
+            if not self.is_running: break
+            
+            # Skip if already has BPM, Waveform, and Fingerprint
+            if s.ext_2 and s.ext_3 and s.ext_4: continue
+            
+            abs_path = os.path.join(self.music_path, s.file_path)
+            self.progress.emit(f"Deep Scanning: {s.title}")
+            
+            data = EssentiaEngine.analyze_track(abs_path)
+            if data:
+                # Update DB
+                s.ext_2 = str(data['bpm'])
+                s.ext_3 = data['waveform']
+                s.ext_4 = data['fingerprint']
+                s.is_mirrored = 0 # Mark for sync since metadata enriched
+                DatabaseManager.add_song(s)
+                count += 1
+                
+        self.finished.emit(count)
+
+
 class ClickableSlider(QSlider):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -234,6 +273,34 @@ class ClickableSlider(QSlider):
             self.setValue(new_val)
             self.sliderReleased.emit() # trigger existing handler
         super().mousePressEvent(event)
+
+class AcousticClustererThread(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(dict) # clusters
+
+    def __init__(self, rel_paths, music_path):
+        super().__init__()
+        self.rel_paths = rel_paths
+        self.music_path = music_path
+
+    def run(self):
+        from metadata import AcoustidEngine
+        clusters = {} # ID -> list of paths
+        
+        for rel_path in self.rel_paths:
+            abs_path = os.path.join(self.music_path, rel_path)
+            self.progress.emit(f"Fingerprinting: {Path(rel_path).name}")
+            
+            # Group by Recording ID
+            group_id = AcoustidEngine.get_release_group_id(abs_path)
+            if not group_id:
+                group_id = "Unknown Acoustic Group"
+                
+            if group_id not in clusters:
+                clusters[group_id] = []
+            clusters[group_id].append(rel_path)
+            
+        self.finished.emit(clusters)
 
 # ------------------------
 # Custom Volume Control
@@ -433,6 +500,7 @@ class EqualizerWidget(QFrame):
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(["Flat", "Rock", "Pop", "Jazz", "Classical", "Vibe"])
         self.preset_combo.setFixedWidth(80)
+        self.preset_combo.currentTextChanged.connect(self.apply_preset)
         header.addWidget(self.preset_combo)
         
         self.on_off = QCheckBox("On")
@@ -462,6 +530,21 @@ class EqualizerWidget(QFrame):
             slider_row.addLayout(v_box)
             
         layout.addLayout(slider_row)
+
+    def apply_preset(self, preset_name):
+        # Placeholder values for each band (-12 to +12)
+        presets = {
+            "Flat": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "Rock": [4, 3, 2, 0, -1, -1, 0, 2, 3, 4],
+            "Pop": [-1, 1, 3, 4, 3, 0, -1, -1, -1, -1],
+            "Jazz": [3, 2, 1, 2, -1, -1, 0, 1, 2, 3],
+            "Classical": [4, 3, 2, 1, 0, 0, -1, -1, -1, 0],
+            "Vibe": [6, 4, 0, -2, -4, -2, 0, 4, 6, 8]
+        }
+        
+        vals = presets.get(preset_name, presets["Flat"])
+        for slider, val in zip(self.sliders, vals):
+            slider.setValue(val)
 
 class VisualizerWidget(QFrame):
     def __init__(self, parent=None):
@@ -513,6 +596,57 @@ class VisualizerWidget(QFrame):
             painter.setPen(Qt.PenStyle.NoPen)
             
             painter.drawRect(int(i * bar_w), int(h - self.heights[i]), int(bar_w - 2), int(self.heights[i]))
+
+class WaveformWidget(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        self.setFixedHeight(80)
+        self.setStyleSheet("background-color: #000000;")
+        
+        self.progress = 0.0 # 0.0 to 1.0
+        self.peaks = []
+        self._generate_vibe_peaks()
+
+    def _generate_vibe_peaks(self):
+        # Create a static simulated waveform
+        self.peaks = [random.randint(10, 60) for _ in range(100)]
+
+    def set_peaks(self, peaks_list):
+        """Sets the waveform to real data peaks."""
+        if peaks_list:
+            self.peaks = peaks_list
+            self.update()
+
+    def set_progress(self, ratio):
+        self.progress = ratio
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        w = self.width()
+        h = self.height()
+        mid_y = h / 2
+        bar_w = w / len(self.peaks)
+        
+        for i, peak in enumerate(self.peaks):
+            # Draw mirrored peaks
+            x = int(i * bar_w)
+            # Color: violet for played, amber for upcoming
+            if (i / len(self.peaks)) <= self.progress:
+                color = QColor("#A78BFA")
+            else:
+                color = QColor("#4A4A4A") # Dim gray for unplayed
+                
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(x, int(mid_y - peak/2), x, int(mid_y + peak/2))
+            
+        # Draw Playhead
+        playhead_x = int(self.progress * w)
+        painter.setPen(QPen(QColor("#FFC107"), 2)) # Amber playhead
+        painter.drawLine(playhead_x, 0, playhead_x, h)
 
 class CaseConversionDialog(QDialog):
     def __init__(self, current_tags, parent=None):
@@ -835,6 +969,147 @@ class AdvancedStatsDialog(QDialog):
             self.trend_table.setItem(i, 0, QTableWidgetItem(row['artist']))
             self.trend_table.setItem(i, 1, QTableWidgetItem(str(row['plays'])))
 
+class MusicBrainzAlbumDialog(QDialog):
+    def __init__(self, selected_songs, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MusicBrainz Album Lookup")
+        self.resize(900, 600)
+        self.local_songs = selected_songs
+        self.result_mappings = [] # List of (local_song_obj, mb_track_dict)
+        
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # --- Tab 1: Search & Results ---
+        self.search_tab = QWidget()
+        self.search_layout = QVBoxLayout(self.search_tab)
+        
+        s_row = QHBoxLayout()
+        # Guess artist/album from first song
+        first = selected_songs[0] if selected_songs else None
+        self.artist_in = QLineEdit(getattr(first, 'artist', '') if first else '')
+        self.album_in = QLineEdit(getattr(first, 'album', '') if first else '')
+        s_row.addWidget(QLabel("Artist:"))
+        s_row.addWidget(self.artist_in)
+        s_row.addWidget(QLabel("Album:"))
+        s_row.addWidget(self.album_in)
+        self.search_btn = QPushButton("Search Album")
+        self.search_btn.clicked.connect(self.perform_album_search)
+        s_row.addWidget(self.search_btn)
+        self.search_layout.addLayout(s_row)
+        
+        self.results_table = QTableWidget(0, 4)
+        self.results_table.setHorizontalHeaderLabels(["Score", "Album Title", "Artist", "Tracks"])
+        self.results_table.horizontalHeader().setStretchLastSection(True)
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.search_layout.addWidget(self.results_table)
+        
+        self.tabs.addTab(self.search_tab, "1. Find Album")
+        
+        # --- Tab 2: Track Mapping ---
+        self.map_tab = QWidget()
+        self.map_layout = QVBoxLayout(self.map_tab)
+        self.map_table = QTableWidget(0, 3)
+        self.map_table.setHorizontalHeaderLabels(["Local File", "-->", "MusicBrainz Track"])
+        self.map_table.horizontalHeader().setStretchLastSection(True)
+        self.map_layout.addWidget(self.map_table)
+        
+        self.tabs.addTab(self.map_tab, "2. Map Tracks")
+        
+        # Main Buttons
+        self.btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        self.apply_btn = self.btns.button(QDialogButtonBox.StandardButton.Apply)
+        self.apply_btn.setEnabled(False)
+        self.btns.accepted.connect(self.accept)
+        self.btns.rejected.connect(self.reject)
+        layout.addWidget(self.btns)
+        
+        self.search_results = []
+
+    def perform_album_search(self):
+        artist = self.artist_in.text().strip()
+        album = self.album_in.text().strip()
+        if not artist and not album: return
+        
+        try:
+            query = f'release:"{album}" AND artist:"{artist}"'
+            result = musicbrainzngs.search_releases(query=query, limit=15)
+            self.search_results = result.get('release-list', [])
+            
+            self.results_table.setRowCount(len(self.search_results))
+            for i, rel in enumerate(self.search_results):
+                score = rel.get('ext:score', '0')
+                title = rel.get('title', 'Unknown')
+                artist_name = rel.get('artist-credit-phrase', 'Unknown')
+                tr_count = rel.get('medium-track-count', '0')
+                
+                self.results_table.setItem(i, 0, QTableWidgetItem(score))
+                self.results_table.setItem(i, 1, QTableWidgetItem(title))
+                self.results_table.setItem(i, 2, QTableWidgetItem(artist_name))
+                self.results_table.setItem(i, 3, QTableWidgetItem(str(tr_count)))
+            
+            self.results_table.itemSelectionChanged.connect(self.load_release_details)
+        except Exception as e:
+            QMessageBox.critical(self, "Search Error", f"Search failed: {e}")
+
+    def load_release_details(self):
+        row = self.results_table.currentRow()
+        if row < 0: return
+        
+        release_id = self.search_results[row]['id']
+        try:
+            # Fetch full release with tracks
+            rel_full = musicbrainzngs.get_release_by_id(release_id, includes=["recordings"])
+            mediums = rel_full['release'].get('medium-list', [])
+            mb_tracks = []
+            for m in mediums:
+                for t in m.get('track-list', []):
+                    mb_tracks.append(t)
+            
+            self.auto_map_tracks(mb_tracks)
+            self.tabs.setCurrentIndex(1) # Move to mapping tab
+            self.apply_btn.setEnabled(True)
+        except Exception as e:
+            QMessageBox.critical(self, "Detail Error", f"Failed to load tracks: {e}")
+
+    def auto_map_tracks(self, mb_tracks):
+        """Simple auto-mapper based on track count/order."""
+        self.result_mappings = []
+        self.map_table.setRowCount(max(len(self.local_songs), len(mb_tracks)))
+        
+        # Sort local songs by track number or filename for better matching
+        local_sorted = sorted(self.local_songs, key=lambda s: s.file_path.name)
+        
+        for i in range(self.map_table.rowCount()):
+            local = local_sorted[i] if i < len(local_sorted) else None
+            mb = mb_tracks[i] if i < len(mb_tracks) else None
+            
+            local_name = local.title if local else "[No File]"
+            self.map_table.setItem(i, 0, QTableWidgetItem(local_name))
+            self.map_table.setItem(i, 1, QTableWidgetItem("-->"))
+            
+            mb_name = f"{mb['number']}. {mb['recording']['title']}" if mb else "[No Match]"
+            self.map_table.setItem(i, 2, QTableWidgetItem(mb_name))
+            
+            if local and mb:
+                self.result_mappings.append((local, mb))
+
+class TagCommand:
+    """Represents a single tag change operation for Undo/Redo."""
+    def __init__(self, rel_path, old_tags, new_tags, description="Tag Update"):
+        self.rel_path = rel_path
+        self.old_tags = old_tags
+        self.new_tags = new_tags
+        self.description = description
+
+class GroupedTagCommand:
+    """Represents a collection of tag changes undone/redone as a single unit."""
+    def __init__(self, commands, description="Mass Tag Update"):
+        self.commands = commands # List of TagCommand objects
+        self.description = description
+
 # ------------------------
 # Main Window
 # ------------------------
@@ -878,7 +1153,12 @@ class MP3Player(QMainWindow):
         self.scanner_thread = None
         self.fixer_thread = None
         self.year_fixer_thread = None
+        self.deep_scanner_thread = None
         self._tree_state_to_restore = None
+        
+        # Undo / Redo Stacks
+        self.undo_stack = []
+        self.redo_stack = []
 
         # Media player
         self.player = QMediaPlayer()
@@ -896,14 +1176,31 @@ class MP3Player(QMainWindow):
         # Equalizer & Visualizer (Placeholders)
         self.equalizer_widget = EqualizerWidget()
         self.visualizer_widget = VisualizerWidget()
-        self.equalizer_widget.hide() # Hidden by default
-        self.visualizer_widget.hide() # Hidden by default
+        self.waveform_widget = WaveformWidget()
+        
+        # Restore EQ settings
+        eq_enabled = self.cfg.get('eq_enabled', True)
+        self.equalizer_widget.on_off.setChecked(eq_enabled)
+        
+        eq_preset = self.cfg.get('eq_preset', "Flat")
+        self.equalizer_widget.preset_combo.setCurrentText(eq_preset)
+        
+        eq_sliders = self.cfg.get('eq_sliders')
+        if eq_sliders and len(eq_sliders) == len(self.equalizer_widget.sliders):
+            for slider, val in zip(self.equalizer_widget.sliders, eq_sliders):
+                slider.setValue(val)
+        
+        # Restore visibility (Wait for build_layout to finalize)
+        self.equalizer_widget.setVisible(self.cfg.get('eq_visible', False))
+        self.visualizer_widget.setVisible(self.cfg.get('visualizer_visible', False))
+        self.waveform_widget.setVisible(self.cfg.get('waveform_visible', False))
 
         # Menu Bar
         self.init_menubar()
 
         # UI pieces
         self.tree = QTreeWidget()
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.setColumnCount(7)
         self.tree.setHeaderLabels(["Title", "Artist", "Track #", "Length", "Rating", "Year", "Comment"])
         self.tree.setRootIsDecorated(False)  # Remove the expander triangles
@@ -1172,6 +1469,10 @@ class MP3Player(QMainWindow):
         musicbrainz_action.triggered.connect(self.tagger_musicbrainz_lookup)
         tagger_menu.addAction(musicbrainz_action)
         
+        musicbrainz_album_action = QAction("MusicBrainz Album Lookup", self)
+        musicbrainz_album_action.triggered.connect(self.tagger_musicbrainz_album_lookup)
+        tagger_menu.addAction(musicbrainz_album_action)
+        
         cluster_action = QAction("Cluster Files", self)
         cluster_action.triggered.connect(self.tagger_cluster_files)
         tagger_menu.addAction(cluster_action)
@@ -1179,19 +1480,30 @@ class MP3Player(QMainWindow):
         fingerprint_action = QAction("Scan Fingerprints (AcoustID)", self)
         fingerprint_action.triggered.connect(self.tagger_scan_fingerprints)
         tagger_menu.addAction(fingerprint_action)
+        
+        tagger_menu.addSeparator()
+        
+        deep_scan_action = QAction("Deep Scan (BPM/Waveform)", self)
+        from metadata import EssentiaEngine
+        deep_scan_action.setEnabled(EssentiaEngine.is_available())
+        deep_scan_action.triggered.connect(self.tagger_deep_scan)
+        tagger_menu.addAction(deep_scan_action)
 
         # 5. View (Modular UI Toggles)
         view_menu = menubar.addMenu("View")
         
         eq_action = QAction("Equalizer", self, checkable=True)
+        eq_action.setChecked(self.equalizer_widget.isVisible())
         eq_action.triggered.connect(self.toggle_equalizer)
         view_menu.addAction(eq_action)
         
         waveform_action = QAction("Waveform Viewer", self, checkable=True)
+        waveform_action.setChecked(self.waveform_widget.isVisible())
         waveform_action.triggered.connect(self.toggle_waveform)
         view_menu.addAction(waveform_action)
         
         visualizer_action = QAction("Visualizer", self, checkable=True)
+        visualizer_action.setChecked(self.visualizer_widget.isVisible())
         visualizer_action.triggered.connect(self.toggle_visualizer)
         view_menu.addAction(visualizer_action)
         
@@ -1355,8 +1667,69 @@ class MP3Player(QMainWindow):
                 self.update_playlist_ui()
                 self.now_playing_label.setText("Playlist Cleared")
     
-    def undo_tag_change(self): pass
-    def redo_tag_change(self): pass
+    def undo_tag_change(self):
+        """Reverts the last tag change (individual or grouped)."""
+        if not self.undo_stack:
+            self.now_playing_label.setText("Nothing to undo")
+            return
+            
+        cmd = self.undo_stack.pop()
+        
+        if isinstance(cmd, GroupedTagCommand):
+            # Undo every sub-command
+            success = True
+            for sub in reversed(cmd.commands):
+                abs_path = os.path.join(self.music_path, sub.rel_path)
+                if not MetadataManager.save_tags(abs_path, sub.old_tags, rel_path=sub.rel_path):
+                    success = False
+            if success:
+                self.redo_stack.append(cmd)
+                self.now_playing_label.setText(f"Undone: {cmd.description}")
+                self.populate_tree()
+            else:
+                QMessageBox.critical(self, "Undo Error", "Failed to fully revert mass update.")
+        else:
+            # Individual TagCommand
+            abs_path = os.path.join(self.music_path, cmd.rel_path)
+            if MetadataManager.save_tags(abs_path, cmd.old_tags, rel_path=cmd.rel_path):
+                self.redo_stack.append(cmd)
+                self.now_playing_label.setText(f"Undone: {cmd.description}")
+                self.load_track_info(cmd.rel_path)
+                self.populate_tree()
+            else:
+                QMessageBox.critical(self, "Undo Error", f"Failed to revert tags for {cmd.rel_path}")
+
+    def redo_tag_change(self):
+        """Re-applies the last undone tag change (individual or grouped)."""
+        if not self.redo_stack:
+            self.now_playing_label.setText("Nothing to redo")
+            return
+            
+        cmd = self.redo_stack.pop()
+        
+        if isinstance(cmd, GroupedTagCommand):
+            # Redo every sub-command
+            success = True
+            for sub in cmd.commands:
+                abs_path = os.path.join(self.music_path, sub.rel_path)
+                if not MetadataManager.save_tags(abs_path, sub.new_tags, rel_path=sub.rel_path):
+                    success = False
+            if success:
+                self.undo_stack.append(cmd)
+                self.now_playing_label.setText(f"Redone: {cmd.description}")
+                self.populate_tree()
+            else:
+                QMessageBox.critical(self, "Redo Error", "Failed to fully re-apply mass update.")
+        else:
+            # Individual TagCommand
+            abs_path = os.path.join(self.music_path, cmd.rel_path)
+            if MetadataManager.save_tags(abs_path, cmd.new_tags, rel_path=cmd.rel_path):
+                self.undo_stack.append(cmd)
+                self.now_playing_label.setText(f"Redone: {cmd.description}")
+                self.load_track_info(cmd.rel_path)
+                self.populate_tree()
+            else:
+                QMessageBox.critical(self, "Redo Error", f"Failed to re-apply tags for {cmd.rel_path}")
     
     def _get_selected_rel_path(self):
         """Helper to get the relative path of the selected track in Tree or Playlist."""
@@ -1435,6 +1808,11 @@ class MP3Player(QMainWindow):
         if dlg.exec():
             # If Ok, save the transformed tags
             if MetadataManager.save_tags(abs_path, dlg.result_tags, rel_path=rel_path):
+                # Push to Undo Stack
+                cmd = TagCommand(rel_path, tags, dlg.result_tags, f"Case Conversion: {Path(rel_path).name}")
+                self.undo_stack.append(cmd)
+                self.redo_stack = []
+                
                 self.load_track_info(rel_path)
                 self.populate_tree()
                 QMessageBox.information(self, "Success", "Case conversion applied successfully.")
@@ -1459,6 +1837,11 @@ class MP3Player(QMainWindow):
         if dlg.exec():
             # If Ok, save the transformed tags
             if MetadataManager.save_tags(abs_path, dlg.result_tags, rel_path=rel_path):
+                # Push to Undo Stack
+                cmd = TagCommand(rel_path, tags, dlg.result_tags, f"Char Replace: {Path(rel_path).name}")
+                self.undo_stack.append(cmd)
+                self.redo_stack = []
+                
                 self.load_track_info(rel_path)
                 self.populate_tree()
                 QMessageBox.information(self, "Success", "Character replacement applied successfully.")
@@ -1503,14 +1886,29 @@ class MP3Player(QMainWindow):
             self.now_playing_label.setText("Autonumbering Album...")
             QApplication.processEvents()
             
+            commands = []
             success_count = 0
             for i, t_item in enumerate(track_items, 1):
                 rel_path = t_item.data(0, Qt.ItemDataRole.UserRole).get('path')
                 abs_path = os.path.join(self.music_path, rel_path)
                 
-                # Save only the tracknumber
+                # Get current song data for Undo
+                song = DatabaseManager.get_song_by_path(rel_path)
+                old_tags = {
+                    'artist': song.artist, 'title': song.title, 'album': song.album,
+                    'genre': song.genre, 'date': song.year, 'tracknumber': str(song.ext_1 or '')
+                }
+                
+                new_tags = old_tags.copy()
+                new_tags['tracknumber'] = str(i)
+                
                 if MetadataManager.save_tags(abs_path, {'tracknumber': str(i)}, rel_path=rel_path):
+                    commands.append(TagCommand(rel_path, old_tags, new_tags))
                     success_count += 1
+            
+            if commands:
+                self.undo_stack.append(GroupedTagCommand(commands, f"Autonumber Album: {item.text(0)}"))
+                self.redo_stack = []
             
             self.populate_tree()
             QMessageBox.information(self, "Success", f"Successfully re-numbered {success_count} tracks.")
@@ -1603,14 +2001,221 @@ class MP3Player(QMainWindow):
             
             if confirm == QMessageBox.StandardButton.Yes:
                 if MetadataManager.save_tags(abs_path, new_data, rel_path=rel_path):
+                    # Push to Undo Stack
+                    cmd = TagCommand(rel_path, tags, new_data.copy(), f"MusicBrainz Lookup: {Path(rel_path).name}")
+                    self.undo_stack.append(cmd)
+                    self.redo_stack = []
+                    
                     self.load_track_info(rel_path)
                     self.populate_tree()
                     QMessageBox.information(self, "Success", "Metadata updated from MusicBrainz.")
                 else:
                     QMessageBox.critical(self, "Error", "Failed to save tags.")
 
-    def tagger_cluster_files(self): pass
-    def tagger_scan_fingerprints(self): pass
+    def tagger_musicbrainz_album_lookup(self):
+        """Mass-updates an entire album using MusicBrainz."""
+        # 1. Collect selected paths
+        selected_rel_paths = []
+        for item in self.tree.selectedItems():
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data.get('type') == 'track':
+                selected_rel_paths.append(data.get('path'))
+        for item in self.playlist_widget.selectedItems():
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path: selected_rel_paths.append(path)
+        selected_rel_paths = list(set(selected_rel_paths))
+
+        if not selected_rel_paths:
+            QMessageBox.information(self, "Album Lookup", "Please select tracks from an album first.")
+            return
+
+        # 2. Get Song objects
+        songs = [DatabaseManager.get_song_by_path(p) for p in selected_rel_paths]
+        
+        # 3. Launch Dialog
+        dlg = MusicBrainzAlbumDialog(songs, self)
+        if dlg.exec():
+            # 4. Perform Mass Update
+            mappings = dlg.result_mappings
+            if not mappings: return
+            
+            confirm = QMessageBox.question(
+                self, "Confirm Mass Update", 
+                f"Are you sure you want to update <b>{len(mappings)}</b> tracks with MusicBrainz data?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if confirm == QMessageBox.StandardButton.Yes:
+                self.now_playing_label.setText("Applying Mass Tag Updates...")
+                QApplication.processEvents()
+                
+                commands = []
+                success_count = 0
+                album_title = dlg.results_table.item(dlg.results_table.currentRow(), 1).text()
+                
+                for song_obj, mb_track in mappings:
+                    rel_path = str(song_obj.file_path)
+                    abs_path = os.path.join(self.music_path, rel_path)
+                    
+                    # Store old state for Undo
+                    old_tags = {
+                        'artist': song_obj.artist, 'title': song_obj.title, 'album': song_obj.album,
+                        'genre': song_obj.genre, 'date': song_obj.year, 'tracknumber': str(song_obj.ext_1 or '')
+                    }
+                    
+                    new_data = {
+                        'artist': mb_track['recording']['artist-credit-phrase'],
+                        'title': mb_track['recording']['title'],
+                        'album': album_title,
+                        'tracknumber': str(mb_track['number'])
+                    }
+                    
+                    if MetadataManager.save_tags(abs_path, new_data, rel_path=rel_path):
+                        commands.append(TagCommand(rel_path, old_tags, new_data.copy()))
+                        success_count += 1
+                
+                if commands:
+                    self.undo_stack.append(GroupedTagCommand(commands, f"MusicBrainz Album Update: {album_title}"))
+                    self.redo_stack = []
+
+                self.populate_tree()
+                QMessageBox.information(self, "Mass Update Complete", f"Successfully updated {success_count} tracks.")
+                self.now_playing_label.setText("Ready")
+
+    def tagger_cluster_files(self):
+        """Groups selected tracks into logical clusters based on folder/metadata or acoustics."""
+        # 1. Collect selected items from Tree and Playlist
+        selected_rel_paths = []
+        
+        for item in self.tree.selectedItems():
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data.get('type') == 'track':
+                selected_rel_paths.append(data.get('path'))
+        for item in self.playlist_widget.selectedItems():
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path: selected_rel_paths.append(path)
+        selected_rel_paths = list(set(selected_rel_paths))
+        
+        if not selected_rel_paths:
+            QMessageBox.information(self, "Clustering", "Please select tracks to cluster first.")
+            return
+
+        # 2. Ask for method
+        msg = "Choose a clustering method:<br><br><b>Metadata</b>: Fast. Groups by folder and album tags.<br><b>Acoustic</b>: Deep. Uses audio signatures to find matching releases."
+        box = QMessageBox(self)
+        box.setWindowTitle("Cluster Wizard")
+        box.setText(msg)
+        meta_btn = box.addButton("Metadata", QMessageBox.ButtonRole.ActionRole)
+        acous_btn = box.addButton("Acoustic (AcoustID)", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        
+        box.exec()
+        
+        if box.clickedButton() == meta_btn:
+            self._perform_metadata_clustering(selected_rel_paths)
+        elif box.clickedButton() == acous_btn:
+            self.tagger_acoustic_cluster(selected_rel_paths)
+
+    def _perform_metadata_clustering(self, paths):
+        clusters = {}
+        for rel_path in paths:
+            song = DatabaseManager.get_song_by_path(rel_path)
+            folder = os.path.dirname(rel_path)
+            album = getattr(song, 'album', 'Unknown') or 'Unknown'
+            group_key = f"{folder} | Album: {album}"
+            if group_key not in clusters: clusters[group_key] = []
+            clusters[group_key].append(rel_path)
+
+        self._display_cluster_report(clusters, len(paths))
+
+    def tagger_acoustic_cluster(self, paths):
+        """Starts background acoustic clustering."""
+        self.now_playing_label.setText("Performing Acoustic Clustering...")
+        self.acoustic_thread = AcousticClustererThread(paths, self.music_path)
+        self.acoustic_thread.progress.connect(lambda msg: self.now_playing_label.setText(msg))
+        self.acoustic_thread.finished.connect(lambda c: self._on_acoustic_clustering_finished(c, len(paths)))
+        self.acoustic_thread.start()
+
+    def _on_acoustic_clustering_finished(self, clusters, total_count):
+        self.now_playing_label.setText("Acoustic Clustering Complete")
+        self._display_cluster_report(clusters, total_count)
+
+    def _display_cluster_report(self, clusters, total_count):
+        msg = f"<b>Cluster Results ({total_count} tracks)</b><br><br>"
+        for key, paths in clusters.items():
+            msg += f"📁 <b>{key}</b> ({len(paths)} tracks)<br>"
+            for p in sorted(paths)[:5]:
+                msg += f"&nbsp;&nbsp;&nbsp;&nbsp;<i>{Path(p).name}</i><br>"
+            if len(paths) > 5:
+                msg += f"&nbsp;&nbsp;&nbsp;&nbsp;... and {len(paths)-5} more<br>"
+            msg += "<br>"
+        QMessageBox.information(self, "Cluster Report", msg)
+
+    def tagger_scan_fingerprints(self):
+        """Identifies the selected track using AcoustID audio fingerprinting."""
+        rel_path = self._get_selected_rel_path()
+        if not rel_path:
+            QMessageBox.information(self, "AcoustID", "Please select a track first.")
+            return
+
+        abs_path = os.path.join(self.music_path, rel_path)
+        if not os.path.exists(abs_path):
+            QMessageBox.critical(self, "Error", f"File not found: {rel_path}")
+            return
+
+        self.now_playing_label.setText("Generating Audio Fingerprint...")
+        QApplication.processEvents()
+
+        from metadata import AcoustidEngine
+        matches = AcoustidEngine.identify_track(abs_path)
+        
+        self.now_playing_label.setText("Ready")
+        
+        if not matches:
+            QMessageBox.information(self, "AcoustID", "No acoustic matches found for this track.")
+            return
+
+        # Pick the top match
+        top = matches[0]
+        msg = (
+            f"<b>AcoustID Match Found ({top['score']}% Confidence)</b><br><br>"
+            f"<b>Artist:</b> {top['artist']}<br>"
+            f"<b>Title:</b> {top['title']}<br><br>"
+            f"Would you like to apply these tags to the file?"
+        )
+        
+        reply = QMessageBox.question(
+            self, "Confirm Acoustic Match", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            new_data = {'artist': top['artist'], 'title': top['title']}
+            if MetadataManager.save_tags(abs_path, new_data, rel_path=rel_path):
+                self.load_track_info(rel_path)
+                self.populate_tree()
+                QMessageBox.information(self, "Success", "Metadata updated via AcoustID.")
+            else:
+                QMessageBox.critical(self, "Error", "Failed to save tags.")
+
+    def tagger_deep_scan(self):
+        """Starts background audio analysis for all tracks missing deep data."""
+        if self.deep_scanner_thread and self.deep_scanner_thread.isRunning():
+            QMessageBox.information(self, "Deep Scan", "Deep Scan is already in progress.")
+            return
+
+        self.now_playing_label.setText("Starting Deep Scan...")
+        self.deep_scanner_thread = DeepScannerThread(self.music_path)
+        self.deep_scanner_thread.progress.connect(lambda msg: self.now_playing_label.setText(msg))
+        self.deep_scanner_thread.finished.connect(self._on_deep_scan_finished)
+        self.deep_scanner_thread.start()
+
+    def _on_deep_scan_finished(self, count):
+        self.now_playing_label.setText("Deep Scan Complete")
+        QMessageBox.information(self, "Deep Scan", f"Deep Scan finished. Analyzed {count} new tracks.")
+        # If the current song was just scanned, refresh its info
+        if self.current_mp3_path:
+            self.load_track_info(self.current_mp3_path)
     
     def toggle_equalizer(self, checked):
         if checked:
@@ -1618,7 +2223,11 @@ class MP3Player(QMainWindow):
         else:
             self.equalizer_widget.hide()
 
-    def toggle_waveform(self, checked): pass
+    def toggle_waveform(self, checked):
+        if checked:
+            self.waveform_widget.show()
+        else:
+            self.waveform_widget.hide()
 
     def toggle_visualizer(self, checked):
         if checked:
@@ -1747,7 +2356,8 @@ class MP3Player(QMainWindow):
         self.now_playing_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         right_v.addWidget(self.now_playing_label)
 
-        # Add Visualizer and Equalizer here
+        # Add Waveform, Visualizer and Equalizer here
+        right_v.addWidget(self.waveform_widget)
         right_v.addWidget(self.visualizer_widget)
         right_v.addWidget(self.equalizer_widget)
 
@@ -2226,6 +2836,26 @@ class MP3Player(QMainWindow):
         # Rating 
         if hasattr(self, "rating_widget"):
             self.rating_widget.load_rating(abs_path, rel_path=rel_path)
+
+        # SOVEREIGN: Load Deep Metadata (BPM / Waveform) from DB
+        song = DatabaseManager.get_song_by_path(rel_path)
+        if song:
+            # 1. Update BPM field if we had one (maybe add a small label later)
+            if song.ext_2:
+                # For now, let's just log it to terminal or update marquee
+                print(f"Deep Data: {song.title} - BPM: {song.ext_2}")
+            
+            # 2. Update Waveform
+            if song.ext_3:
+                try:
+                    peaks = [int(p) for p in song.ext_3.split(",")]
+                    self.waveform_widget.set_peaks(peaks)
+                except Exception:
+                    self.waveform_widget._generate_vibe_peaks()
+            else:
+                self.waveform_widget._generate_vibe_peaks()
+        else:
+            self.waveform_widget._generate_vibe_peaks()
     def on_tree_item_double_clicked(self, item, col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data:
@@ -2694,6 +3324,10 @@ class MP3Player(QMainWindow):
         self._current_session_accumulated_ms = 0
         self._current_session_last_pos = 0
         
+        # Reset Waveform for the new track
+        self.waveform_widget._generate_vibe_peaks()
+        self.waveform_widget.set_progress(0.0)
+        
         abs_path = os.path.join(self.music_path, path)
         self.player.setSource(QUrl.fromLocalFile(abs_path))
         self.player.play()
@@ -2784,6 +3418,9 @@ class MP3Player(QMainWindow):
             # Update furthest point reached for history metrics
             if pos > self._current_session_max_pos:
                 self._current_session_max_pos = pos
+
+            # Update waveform progress
+            self.waveform_widget.set_progress(ratio)
 
             # Play-count metric logic: Trigger at 30%
             if not self._play_counted and ratio >= 0.30:
@@ -2907,6 +3544,13 @@ class MP3Player(QMainWindow):
         self.cfg['library_column_widths'] = [self.tree.columnWidth(i) for i in range(self.tree.columnCount())]
         self.cfg['playlist_column_widths'] = [self.playlist_widget.columnWidth(i) for i in range(self.playlist_widget.columnCount())]
         
+        # Save EQ state
+        self.cfg['eq_enabled'] = self.equalizer_widget.on_off.isChecked()
+        self.cfg['eq_preset'] = self.equalizer_widget.preset_combo.currentText()
+        self.cfg['eq_sliders'] = [s.value() for s in self.equalizer_widget.sliders]
+        self.cfg['eq_visible'] = self.equalizer_widget.isVisible()
+        self.cfg['visualizer_visible'] = self.visualizer_widget.isVisible()
+
         save_config(self.cfg)
 
         # Stop background threads
@@ -2941,14 +3585,28 @@ class MP3Player(QMainWindow):
         # --- Step 2: Save the tags to the file and database ---
         rel_path = self.current_mp3_path
         abs_path = os.path.join(self.music_path, rel_path)
-        
-        if not MetadataManager.save_tags(abs_path, new_tag_data.copy(), rel_path=rel_path):
+
+        # Prepare old tags for Undo (Convert old_song object to dict matching our save keys)
+        old_tag_dict = {
+            'artist': old_song.artist,
+            'title': old_song.title,
+            'album': old_song.album,
+            'genre': old_song.genre,
+            'date': old_song.year,
+            'tracknumber': str(old_song.ext_1 or '')
+        }
+
+        if MetadataManager.save_tags(abs_path, new_tag_data.copy(), rel_path=rel_path):
+            # Push to Undo Stack
+            cmd = TagCommand(rel_path, old_tag_dict, new_tag_data.copy(), f"Edit Tags: {Path(rel_path).name}")
+            self.undo_stack.append(cmd)
+            self.redo_stack = [] # Clear redo on new action
+
+            QMessageBox.information(self, "Tags Saved", f"Tags for {Path(rel_path).name} saved successfully.")
+            self._mark_snapshot_dirty()
+        else:
             QMessageBox.critical(self, "Error Saving Tags", f"Failed to save tags for {Path(rel_path).name}.")
             return
-        
-        QMessageBox.information(self, "Tags Saved", f"Tags for {Path(rel_path).name} saved successfully.")
-        self._mark_snapshot_dirty()
-
         # --- Step 3: Decide how to update the UI ---
         hierarchy_changed = (
             old_song.genre != new_tag_data.get('genre') or
